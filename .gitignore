@@ -36,3 +36,5 @@ coverage/
 tmp/
 temp/
 *.tmp
+.env
+.npmrc

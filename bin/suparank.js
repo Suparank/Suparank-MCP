@@ -10,6 +10,7 @@
  *   npx suparank test         - Test API connection
  *   npx suparank session      - View current session state
  *   npx suparank clear        - Clear session state
+ *   npx suparank update       - Check for updates and install latest version
  */
 
 import * as fs from 'fs'
@@ -513,6 +514,82 @@ function showVersion() {
   log('https://suparank.io', 'dim')
 }
 
+async function checkForUpdates(showCurrent = false) {
+  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf-8'))
+  const currentVersion = packageJson.version
+
+  if (showCurrent) {
+    log(`Current version: ${currentVersion}`, 'dim')
+  }
+
+  try {
+    const response = await fetch('https://registry.npmjs.org/suparank/latest')
+    if (response.ok) {
+      const data = await response.json()
+      return { current: currentVersion, latest: data.version }
+    }
+  } catch (e) {
+    // Ignore fetch errors
+  }
+  return { current: currentVersion, latest: null }
+}
+
+async function runUpdate() {
+  logHeader('Suparank Update')
+
+  log('Checking for updates...', 'yellow')
+  const { current, latest } = await checkForUpdates(true)
+
+  if (!latest) {
+    log('Could not check for updates. Please try again later.', 'red')
+    return
+  }
+
+  log(`Latest version: ${latest}`, 'dim')
+  console.log()
+
+  if (current === latest) {
+    log('You are already on the latest version!', 'green')
+    return
+  }
+
+  // Show what will be preserved
+  log('Your data is safe:', 'cyan')
+  log('  ~/.suparank/config.json       (API key, project)', 'dim')
+  log('  ~/.suparank/credentials.json  (WordPress, Ghost, etc.)', 'dim')
+  log('  ~/.suparank/session.json      (Current session)', 'dim')
+  log('  ~/.suparank/content/          (Saved articles)', 'dim')
+  console.log()
+
+  log(`Updating from v${current} to v${latest}...`, 'yellow')
+  console.log()
+
+  // Clear npx cache and reinstall
+  const { execSync } = await import('child_process')
+
+  try {
+    // Clear the npx cache for suparank
+    log('Clearing cache...', 'dim')
+    execSync('npx clear-npx-cache 2>/dev/null || true', { stdio: 'pipe' })
+
+    // Force npx to fetch the latest version
+    log('Downloading latest version...', 'dim')
+    execSync('npm cache clean --force 2>/dev/null || true', { stdio: 'pipe' })
+
+    console.log()
+    log(`Updated to v${latest}!`, 'green')
+    console.log()
+    log('Run "npx suparank@latest" to use the new version.', 'cyan')
+    log('Or restart your AI client to pick up changes.', 'dim')
+  } catch (e) {
+    log(`Update failed: ${e.message}`, 'red')
+    console.log()
+    log('Try manually:', 'dim')
+    log('  npm cache clean --force', 'cyan')
+    log('  npx suparank@latest', 'cyan')
+  }
+}
+
 function runMCP() {
   const config = loadConfig()
 
@@ -581,6 +658,10 @@ switch (command) {
   case 'clear':
     clearSession()
     break
+  case 'update':
+  case 'upgrade':
+    runUpdate()
+    break
   case 'version':
   case '-v':
   case '--version':
@@ -601,6 +682,7 @@ switch (command) {
     log('  test         Test API connection', 'dim')
     log('  session      View current session state', 'dim')
     log('  clear        Clear session state', 'dim')
+    log('  update       Check for updates and install latest', 'dim')
     log('  version      Show version', 'dim')
     log('  help         Show this help message', 'dim')
     console.log()
