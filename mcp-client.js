@@ -1,0 +1,2446 @@
+#!/usr/bin/env node
+
+/**
+ * Suparank MCP - Stdio Client
+ *
+ * Local MCP client that connects to the Suparank backend API.
+ * Works with Claude Desktop and Cursor via stdio transport.
+ *
+ * Usage:
+ *   npx suparank
+ *   node mcp-client.js <project-slug> <api-key>
+ *
+ * Credentials:
+ *   Local credentials are loaded from ~/.suparank/credentials.json
+ *   These enable additional tools: image generation, CMS publishing, webhooks
+ *
+ * Note: API keys are more secure than JWT tokens for MCP connections
+ * because they don't expire and can be revoked individually.
+ */
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js'
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  InitializeRequestSchema
+} from '@modelcontextprotocol/sdk/types.js'
+import * as fs from 'fs'
+import { marked } from 'marked'
+import * as path from 'path'
+import * as os from 'os'
+
+// Parse command line arguments
+const projectSlug = process.argv[2]
+const apiKey = process.argv[3]
+const apiUrl = process.env.SUPARANK_API_URL || 'https://api.suparank.io'
+
+if (!projectSlug) {
+  console.error('Error: Project slug is required')
+  console.error('Usage: node mcp-client.js <project-slug> <api-key>')
+  console.error('Example: node mcp-client.js my-project sk_live_abc123...')
+  process.exit(1)
+}
+
+if (!apiKey) {
+  console.error('Error: API key is required')
+  console.error('Usage: node mcp-client.js <project-slug> <api-key>')
+  console.error('')
+  console.error('To create an API key:')
+  console.error('1. Sign in at https://suparank.io/dashboard')
+  console.error('2. Go to Settings > API Keys')
+  console.error('3. Click "Create API Key"')
+  console.error('4. Copy the key (shown only once!)')
+  console.error('')
+  console.error('Or run: npx suparank setup')
+  process.exit(1)
+}
+
+// Validate API key format
+if (!apiKey.startsWith('sk_live_') && !apiKey.startsWith('sk_test_')) {
+  console.error('Error: Invalid API key format')
+  console.error('API keys must start with "sk_live_" or "sk_test_"')
+  console.error('Example: sk_live_abc123...')
+  process.exit(1)
+}
+
+// Log to stderr (stdout is used for MCP protocol)
+const log = (...args) => console.error('[suparank]', ...args)
+
+// Structured progress logging for user visibility
+const progress = (step, message) => console.error(`[suparank] ${step}: ${message}`)
+
+// Local credentials storage
+let localCredentials = null
+
+// Session state for orchestration - stores content between steps
+const sessionState = {
+  currentWorkflow: null,
+  stepResults: {},
+  article: null,
+  title: null,
+  imageUrl: null,        // Cover image
+  inlineImages: [],      // Array of inline image URLs
+  keywords: null,
+  metadata: null,
+  metaTitle: null,
+  metaDescription: null,
+  contentFolder: null    // Path to saved content folder
+}
+
+/**
+ * Get the path to the Suparank config directory (~/.suparank/)
+ */
+function getSuparankDir() {
+  return path.join(os.homedir(), '.suparank')
+}
+
+/**
+ * Get the path to the session file (~/.suparank/session.json)
+ */
+function getSessionFilePath() {
+  return path.join(getSuparankDir(), 'session.json')
+}
+
+/**
+ * Get the path to the content directory (~/.suparank/content/)
+ */
+function getContentDir() {
+  return path.join(getSuparankDir(), 'content')
+}
+
+/**
+ * Ensure the Suparank config directory exists
+ */
+function ensureSuparankDir() {
+  const dir = getSuparankDir()
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+    log(`Created config directory: ${dir}`)
+  }
+}
+
+/**
+ * Ensure content directory exists
+ */
+function ensureContentDir() {
+  const dir = getContentDir()
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+  }
+  return dir
+}
+
+/**
+ * Generate a slug from title for folder naming
+ */
+function slugify(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .substring(0, 50)
+}
+
+/**
+ * Atomic file write - prevents corruption on concurrent writes
+ */
+function atomicWriteSync(filePath, data) {
+  const tmpFile = filePath + '.tmp.' + process.pid
+  try {
+    fs.writeFileSync(tmpFile, data)
+    fs.renameSync(tmpFile, filePath) // Atomic on POSIX
+  } catch (error) {
+    // Clean up temp file if rename failed
+    try { fs.unlinkSync(tmpFile) } catch (e) { /* ignore */ }
+    throw error
+  }
+}
+
+/**
+ * Fetch with timeout - prevents hanging requests
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    })
+    return response
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+/**
+ * Fetch with retry - handles transient failures
+ */
+async function fetchWithRetry(url, options = {}, maxRetries = 3, timeoutMs = 30000) {
+  let lastError
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, options, timeoutMs)
+
+      // Retry on 5xx errors or rate limiting
+      if (response.status >= 500 || response.status === 429) {
+        const retryAfter = response.headers.get('retry-after')
+        const delay = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 1000
+
+        if (attempt < maxRetries) {
+          log(`Request failed (${response.status}), retrying in ${delay}ms... (attempt ${attempt}/${maxRetries})`)
+          await new Promise(resolve => setTimeout(resolve, delay))
+          continue
+        }
+      }
+
+      return response
+    } catch (error) {
+      lastError = error
+
+      // Retry on network errors
+      if (error.name === 'AbortError') {
+        lastError = new Error(`Request timeout after ${timeoutMs}ms`)
+      }
+
+      if (attempt < maxRetries) {
+        const delay = Math.pow(2, attempt) * 1000
+        log(`Request error: ${lastError.message}, retrying in ${delay}ms... (attempt ${attempt}/${maxRetries})`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+
+  throw lastError
+}
+
+/**
+ * Load session state from file (survives MCP restarts)
+ */
+function loadSession() {
+  try {
+    const sessionFile = getSessionFilePath()
+    if (fs.existsSync(sessionFile)) {
+      const content = fs.readFileSync(sessionFile, 'utf-8')
+      const saved = JSON.parse(content)
+
+      // Check if session is stale (older than 24 hours)
+      const savedAt = new Date(saved.savedAt)
+      const hoursSinceSave = (Date.now() - savedAt.getTime()) / (1000 * 60 * 60)
+      if (hoursSinceSave > 24) {
+        log(`Session expired (${Math.round(hoursSinceSave)} hours old), starting fresh`)
+        clearSessionFile()
+        return false
+      }
+
+      // Restore session state
+      sessionState.currentWorkflow = saved.currentWorkflow || null
+      sessionState.stepResults = saved.stepResults || {}
+      sessionState.article = saved.article || null
+      sessionState.title = saved.title || null
+      sessionState.imageUrl = saved.imageUrl || null
+      sessionState.inlineImages = saved.inlineImages || []
+      sessionState.keywords = saved.keywords || null
+      sessionState.metadata = saved.metadata || null
+      sessionState.metaTitle = saved.metaTitle || null
+      sessionState.metaDescription = saved.metaDescription || null
+      sessionState.contentFolder = saved.contentFolder || null
+
+      log(`Restored session from ${sessionFile}`)
+      if (sessionState.title) {
+        log(`  - Article: "${sessionState.title}" (${sessionState.article?.split(/\s+/).length || 0} words)`)
+      }
+      if (sessionState.imageUrl) {
+        log(`  - Cover image: ${sessionState.imageUrl.substring(0, 50)}...`)
+      }
+      if (sessionState.contentFolder) {
+        log(`  - Content folder: ${sessionState.contentFolder}`)
+      }
+      return true
+    }
+  } catch (error) {
+    log(`Warning: Failed to load session: ${error.message}`)
+  }
+  return false
+}
+
+/**
+ * Save session state to file (persists across MCP restarts)
+ * Uses atomic write to prevent corruption
+ */
+function saveSession() {
+  try {
+    ensureSuparankDir()
+    const sessionFile = getSessionFilePath()
+
+    const toSave = {
+      currentWorkflow: sessionState.currentWorkflow,
+      stepResults: sessionState.stepResults,
+      article: sessionState.article,
+      title: sessionState.title,
+      imageUrl: sessionState.imageUrl,
+      inlineImages: sessionState.inlineImages,
+      keywords: sessionState.keywords,
+      metadata: sessionState.metadata,
+      metaTitle: sessionState.metaTitle,
+      metaDescription: sessionState.metaDescription,
+      contentFolder: sessionState.contentFolder,
+      savedAt: new Date().toISOString()
+    }
+
+    // Atomic write to prevent corruption
+    atomicWriteSync(sessionFile, JSON.stringify(toSave, null, 2))
+    progress('Session', `Saved to ${sessionFile}`)
+  } catch (error) {
+    log(`Warning: Failed to save session: ${error.message}`)
+    progress('Session', `FAILED to save: ${error.message}`)
+  }
+}
+
+/**
+ * Save content to a dedicated folder with all assets
+ * Creates: ~/.suparank/content/{date}-{slug}/
+ *   - article.md (markdown content)
+ *   - metadata.json (title, keywords, etc.)
+ *   - workflow.json (workflow state for resuming)
+ */
+function saveContentToFolder() {
+  if (!sessionState.title || !sessionState.article) {
+    return null
+  }
+
+  try {
+    ensureContentDir()
+
+    // Create folder name: YYYY-MM-DD-slug
+    const date = new Date().toISOString().split('T')[0]
+    const slug = slugify(sessionState.title)
+    const folderName = `${date}-${slug}`
+    const folderPath = path.join(getContentDir(), folderName)
+
+    // Create folder if doesn't exist
+    if (!fs.existsSync(folderPath)) {
+      fs.mkdirSync(folderPath, { recursive: true })
+    }
+
+    // Save markdown article
+    atomicWriteSync(
+      path.join(folderPath, 'article.md'),
+      sessionState.article
+    )
+
+    // Save metadata
+    const metadata = {
+      title: sessionState.title,
+      keywords: sessionState.keywords || [],
+      metaDescription: sessionState.metaDescription || '',
+      metaTitle: sessionState.metaTitle || sessionState.title,
+      imageUrl: sessionState.imageUrl,
+      inlineImages: sessionState.inlineImages || [],
+      wordCount: sessionState.article.split(/\s+/).length,
+      createdAt: new Date().toISOString(),
+      projectSlug: projectSlug
+    }
+    atomicWriteSync(
+      path.join(folderPath, 'metadata.json'),
+      JSON.stringify(metadata, null, 2)
+    )
+
+    // Save workflow state for resuming
+    if (sessionState.currentWorkflow) {
+      atomicWriteSync(
+        path.join(folderPath, 'workflow.json'),
+        JSON.stringify({
+          workflow: sessionState.currentWorkflow,
+          stepResults: sessionState.stepResults,
+          savedAt: new Date().toISOString()
+        }, null, 2)
+      )
+    }
+
+    // Store folder path in session
+    sessionState.contentFolder = folderPath
+
+    progress('Content', `Saved to folder: ${folderPath}`)
+    return folderPath
+  } catch (error) {
+    log(`Warning: Failed to save content to folder: ${error.message}`)
+    return null
+  }
+}
+
+/**
+ * Clear session file (called after successful publish or on reset)
+ */
+function clearSessionFile() {
+  try {
+    const sessionFile = getSessionFilePath()
+    if (fs.existsSync(sessionFile)) {
+      fs.unlinkSync(sessionFile)
+    }
+  } catch (error) {
+    log(`Warning: Failed to clear session file: ${error.message}`)
+  }
+}
+
+/**
+ * Reset session state for new workflow
+ */
+function resetSession() {
+  sessionState.currentWorkflow = null
+  sessionState.stepResults = {}
+  sessionState.article = null
+  sessionState.title = null
+  sessionState.imageUrl = null
+  sessionState.inlineImages = []
+  sessionState.keywords = null
+  sessionState.metadata = null
+  sessionState.metaTitle = null
+  sessionState.metaDescription = null
+  sessionState.contentFolder = null
+
+  // Clear persisted session file when starting fresh
+  clearSessionFile()
+}
+
+/**
+ * Load credentials from ~/.suparank/credentials.json
+ * Falls back to legacy .env.superwriter paths for backward compatibility
+ */
+function loadLocalCredentials() {
+  const searchPaths = [
+    path.join(os.homedir(), '.suparank', 'credentials.json'),
+    path.join(process.cwd(), '.env.superwriter'),  // Legacy support
+    path.join(os.homedir(), '.env.superwriter')    // Legacy support
+  ]
+
+  for (const filePath of searchPaths) {
+    if (fs.existsSync(filePath)) {
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8')
+        const parsed = JSON.parse(content)
+        log(`Loaded credentials from: ${filePath}`)
+        return parsed
+      } catch (e) {
+        log(`Warning: Failed to parse ${filePath}: ${e.message}`)
+      }
+    }
+  }
+
+  log('No credentials found. Run "npx suparank setup" to configure. Action tools will be limited.')
+  return null
+}
+
+/**
+ * Check if a credential type is available
+ */
+function hasCredential(type) {
+  if (!localCredentials) return false
+
+  switch (type) {
+    case 'wordpress':
+      return !!localCredentials.wordpress?.secret_key || !!localCredentials.wordpress?.app_password
+    case 'ghost':
+      return !!localCredentials.ghost?.admin_api_key
+    case 'fal':
+      return !!localCredentials.fal?.api_key
+    case 'gemini':
+      return !!localCredentials.gemini?.api_key
+    case 'wiro':
+      return !!localCredentials.wiro?.api_key
+    case 'image':
+      const provider = localCredentials.image_provider
+      return provider && hasCredential(provider)
+    case 'webhooks':
+      return !!localCredentials.webhooks && Object.values(localCredentials.webhooks).some(Boolean)
+    default:
+      return false
+  }
+}
+
+/**
+ * Get composition hints for a tool from local credentials
+ */
+function getCompositionHints(toolName) {
+  if (!localCredentials?.tool_instructions) return null
+
+  const instruction = localCredentials.tool_instructions.find(t => t.tool_name === toolName)
+  return instruction?.composition_hints || null
+}
+
+/**
+ * Get list of external MCPs configured
+ */
+function getExternalMCPs() {
+  return localCredentials?.external_mcps || []
+}
+
+// Fetch project config from API
+async function fetchProjectConfig() {
+  try {
+    const response = await fetchWithRetry(`${apiUrl}/projects/${projectSlug}`, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      }
+    }, 3, 15000) // 3 retries, 15s timeout
+
+    if (!response.ok) {
+      const error = await response.text()
+
+      if (response.status === 401) {
+        throw new Error(`Invalid or expired API key. Please create a new one in the dashboard.`)
+      }
+
+      throw new Error(`Failed to fetch project: ${error}`)
+    }
+
+    const data = await response.json()
+    return data.project
+  } catch (error) {
+    log('Error fetching project config:', error.message)
+    throw error
+  }
+}
+
+// Call backend API to execute tool
+async function callBackendTool(toolName, args) {
+  try {
+    const response = await fetch(`${apiUrl}/tools/${projectSlug}/${toolName}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ arguments: args })
+    })
+
+    if (!response.ok) {
+      const error = await response.text()
+
+      if (response.status === 401) {
+        throw new Error(`Invalid or expired API key. Please create a new one in the dashboard.`)
+      }
+
+      throw new Error(`Tool execution failed: ${error}`)
+    }
+
+    const result = await response.json()
+    return result
+  } catch (error) {
+    log('Error calling tool:', error.message)
+    throw error
+  }
+}
+
+// Tool definitions (synced with backend)
+const TOOLS = [
+  {
+    name: 'keyword_research',
+    description: 'Conduct keyword research and competitive analysis for SEO content. Analyzes search volume, difficulty, and opportunity. If no keyword provided, uses project primary keywords automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        seed_keyword: {
+          type: 'string',
+          description: 'Starting keyword or topic to research (optional - uses project primary keywords if not specified)'
+        },
+        content_goal: {
+          type: 'string',
+          enum: ['traffic', 'conversions', 'brand-awareness'],
+          description: 'Primary goal for the content strategy (optional - defaults to traffic)'
+        },
+        competitor_domain: {
+          type: 'string',
+          description: 'Optional: Competitor domain to analyze'
+        }
+      }
+    }
+  },
+  {
+    name: 'seo_strategy',
+    description: 'Create comprehensive SEO strategy and content brief. Works with project keywords automatically if none specified.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target_keyword: {
+          type: 'string',
+          description: 'Main keyword to target (optional - uses project primary keywords if not specified)'
+        },
+        content_type: {
+          type: 'string',
+          enum: ['guide', 'listicle', 'how-to', 'comparison', 'review'],
+          description: 'Type of content to create (optional - defaults to guide)'
+        },
+        search_intent: {
+          type: 'string',
+          enum: ['informational', 'commercial', 'transactional', 'navigational'],
+          description: 'Primary search intent to target (optional - auto-detected)'
+        }
+      }
+    }
+  },
+  {
+    name: 'topical_map',
+    description: 'Design pillar-cluster content architecture for topical authority. Uses project niche and keywords automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        core_topic: {
+          type: 'string',
+          description: 'Main topic for the content cluster (optional - uses project niche if not specified)'
+        },
+        depth: {
+          type: 'number',
+          enum: [1, 2, 3],
+          description: 'Depth of content cluster: 1 (pillar + 5 articles), 2 (+ subtopics), 3 (full hierarchy)',
+          default: 2
+        }
+      }
+    }
+  },
+  {
+    name: 'content_calendar',
+    description: 'Create editorial calendar and publication schedule. Uses project keywords and niche automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        time_period: {
+          type: 'string',
+          enum: ['week', 'month', 'quarter'],
+          description: 'Planning period for the content calendar (optional - defaults to month)',
+          default: 'month'
+        },
+        content_types: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Types of content to include (optional - defaults to blog)'
+        },
+        priority_keywords: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Keywords to prioritize (optional - uses project keywords)'
+        }
+      }
+    }
+  },
+  {
+    name: 'content_write',
+    description: 'Write comprehensive, SEO-optimized blog articles. Creates engaging content with proper structure, internal links, and semantic optimization. Uses project brand voice and keywords automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Article title or headline (optional - can be generated from topic)'
+        },
+        target_keyword: {
+          type: 'string',
+          description: 'Primary keyword to optimize for (optional - uses project keywords)'
+        },
+        outline: {
+          type: 'string',
+          description: 'Optional: Article outline or structure (H2/H3 headings)'
+        },
+        tone: {
+          type: 'string',
+          enum: ['professional', 'casual', 'conversational', 'technical'],
+          description: 'Writing tone (optional - uses project brand voice)'
+        }
+      }
+    }
+  },
+  {
+    name: 'image_prompt',
+    description: 'Create optimized prompts for AI image generation. Designs prompts for blog hero images, section illustrations, and branded visuals. Uses project visual style and brand automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        image_purpose: {
+          type: 'string',
+          enum: ['hero', 'section', 'diagram', 'comparison', 'infographic'],
+          description: 'Purpose of the image (optional - defaults to hero)',
+          default: 'hero'
+        },
+        subject: {
+          type: 'string',
+          description: 'Main subject or concept for the image (optional - uses project niche)'
+        },
+        mood: {
+          type: 'string',
+          description: 'Optional: Desired mood (uses project visual style if not specified)'
+        }
+      }
+    }
+  },
+  {
+    name: 'internal_links',
+    description: 'Develop strategic internal linking plan. Analyzes existing content and identifies linking opportunities for improved site architecture. Works with project content automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        current_page: {
+          type: 'string',
+          description: 'URL or title of the page to optimize (optional - can work with last created content)'
+        },
+        available_pages: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of existing pages to consider (optional - can analyze site automatically)'
+        },
+        link_goal: {
+          type: 'string',
+          enum: ['authority-building', 'user-navigation', 'conversion'],
+          description: 'Primary goal for internal linking (optional - defaults to authority-building)'
+        }
+      }
+    }
+  },
+  {
+    name: 'schema_generate',
+    description: 'Implement Schema.org structured data markup. Analyzes content to recommend and generate appropriate JSON-LD schemas for enhanced search visibility. Auto-detects page type if not specified.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_type: {
+          type: 'string',
+          enum: ['article', 'product', 'how-to', 'faq', 'review', 'organization'],
+          description: 'Type of page to generate schema for (optional - auto-detected from content)'
+        },
+        content_summary: {
+          type: 'string',
+          description: 'Brief summary of the page content (optional - can analyze content)'
+        }
+      }
+    }
+  },
+  {
+    name: 'geo_optimize',
+    description: 'Optimize content for AI search engines and Google SGE. Implements GEO (Generative Engine Optimization) best practices for LLM-friendly content. Works with project content automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content_url: {
+          type: 'string',
+          description: 'URL or title of content to optimize (optional - can work with last created content)'
+        },
+        target_engines: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: ['chatgpt', 'perplexity', 'claude', 'gemini', 'google-sge']
+          },
+          description: 'AI search engines to optimize for (optional - defaults to all)',
+          default: ['chatgpt', 'google-sge']
+        }
+      }
+    }
+  },
+  {
+    name: 'quality_check',
+    description: 'Perform comprehensive pre-publish quality assurance. Checks grammar, SEO requirements, brand consistency, accessibility, and technical accuracy. Can review last created content automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: {
+          type: 'string',
+          description: 'Full content to review (optional - can review last created content)'
+        },
+        check_type: {
+          type: 'string',
+          enum: ['full', 'seo-only', 'grammar-only', 'brand-only'],
+          description: 'Type of quality check to perform (optional - defaults to full)',
+          default: 'full'
+        }
+      }
+    }
+  },
+  {
+    name: 'full_pipeline',
+    description: 'Execute complete 5-phase content creation pipeline. Orchestrates research, planning, creation, optimization, and quality checking in one workflow. Works with project configuration automatically - just describe what you need!',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        seed_keyword: {
+          type: 'string',
+          description: 'Starting keyword for the pipeline (optional - uses project primary keywords and niche)'
+        },
+        content_type: {
+          type: 'string',
+          enum: ['guide', 'listicle', 'how-to', 'comparison', 'review'],
+          description: 'Type of content to create (optional - defaults to guide)',
+          default: 'guide'
+        },
+        skip_phases: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: ['research', 'planning', 'creation', 'optimization', 'quality']
+          },
+          description: 'Optional: Phases to skip in the pipeline'
+        }
+      }
+    }
+  }
+]
+
+// Action tools that require local credentials
+const ACTION_TOOLS = [
+  {
+    name: 'generate_image',
+    description: 'Generate AI images using configured provider (fal.ai, Gemini Imagen, or wiro.ai). Requires image provider API key in ~/.suparank/credentials.json',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          description: 'Detailed prompt for image generation'
+        },
+        style: {
+          type: 'string',
+          description: 'Style guidance (e.g., "minimalist", "photorealistic", "illustration")'
+        },
+        aspect_ratio: {
+          type: 'string',
+          enum: ['1:1', '16:9', '9:16', '4:3', '3:4'],
+          description: 'Image aspect ratio',
+          default: '16:9'
+        }
+      },
+      required: ['prompt']
+    },
+    requiresCredential: 'image'
+  },
+  {
+    name: 'publish_wordpress',
+    description: 'Publish content directly to WordPress (supports .com and .org). Requires WordPress credentials in ~/.suparank/credentials.json',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Post title'
+        },
+        content: {
+          type: 'string',
+          description: 'Full post content (HTML or Markdown)'
+        },
+        status: {
+          type: 'string',
+          enum: ['draft', 'publish'],
+          description: 'Publication status',
+          default: 'draft'
+        },
+        categories: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Category names'
+        },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Tag names'
+        },
+        featured_image_url: {
+          type: 'string',
+          description: 'URL of featured image to upload'
+        }
+      },
+      required: ['title', 'content']
+    },
+    requiresCredential: 'wordpress'
+  },
+  {
+    name: 'publish_ghost',
+    description: 'Publish content to Ghost CMS. Requires Ghost Admin API key in ~/.suparank/credentials.json',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Post title'
+        },
+        content: {
+          type: 'string',
+          description: 'Full post content (HTML or Markdown)'
+        },
+        status: {
+          type: 'string',
+          enum: ['draft', 'published'],
+          description: 'Publication status',
+          default: 'draft'
+        },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Tag names'
+        },
+        featured_image_url: {
+          type: 'string',
+          description: 'URL of featured image'
+        }
+      },
+      required: ['title', 'content']
+    },
+    requiresCredential: 'ghost'
+  },
+  {
+    name: 'send_webhook',
+    description: 'Send data to configured webhooks (Make.com, n8n, Zapier, Slack). Requires webhook URLs in ~/.suparank/credentials.json',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        webhook_type: {
+          type: 'string',
+          enum: ['default', 'make', 'n8n', 'zapier', 'slack'],
+          description: 'Which webhook to use',
+          default: 'default'
+        },
+        payload: {
+          type: 'object',
+          description: 'Data to send in the webhook'
+        },
+        message: {
+          type: 'string',
+          description: 'For Slack: formatted message text'
+        }
+      },
+      required: ['webhook_type']
+    },
+    requiresCredential: 'webhooks'
+  }
+]
+
+// Orchestrator tools for automated workflows
+const ORCHESTRATOR_TOOLS = [
+  {
+    name: 'create_content',
+    description: `🚀 MAIN ENTRY POINT - Just tell me what content you want!
+
+Examples:
+- "Write a blog post about AI tools"
+- "Create 3 articles about SEO"
+- "Write content for my project"
+
+I will automatically:
+1. Research keywords (using SEO MCP if available)
+2. Plan content structure
+3. Guide you through writing
+4. Generate images
+5. Publish to your configured CMS (Ghost/WordPress)
+
+No parameters needed - I use your project settings automatically!`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        request: {
+          type: 'string',
+          description: 'What content do you want? (e.g., "write a blog post about AI", "create 5 articles")'
+        },
+        count: {
+          type: 'number',
+          description: 'Number of articles to create (default: 1)',
+          default: 1
+        },
+        publish_to: {
+          type: 'array',
+          items: { type: 'string', enum: ['ghost', 'wordpress', 'none'] },
+          description: 'Where to publish (default: all configured CMS)',
+          default: []
+        },
+        with_images: {
+          type: 'boolean',
+          description: 'Generate hero images (default: true)',
+          default: true
+        }
+      }
+    }
+  },
+  {
+    name: 'save_content',
+    description: 'Save generated content to session for publishing. Call this after you finish writing an article.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Article title'
+        },
+        content: {
+          type: 'string',
+          description: 'Full article content (markdown)'
+        },
+        keywords: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Target keywords used'
+        },
+        meta_description: {
+          type: 'string',
+          description: 'SEO meta description'
+        }
+      },
+      required: ['title', 'content']
+    }
+  },
+  {
+    name: 'publish_content',
+    description: 'Publish saved content to configured CMS platforms. Automatically uses saved article and generated image.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        platforms: {
+          type: 'array',
+          items: { type: 'string', enum: ['ghost', 'wordpress', 'all'] },
+          description: 'Platforms to publish to (default: all configured)',
+          default: ['all']
+        },
+        status: {
+          type: 'string',
+          enum: ['draft', 'publish'],
+          description: 'Publication status',
+          default: 'draft'
+        },
+        category: {
+          type: 'string',
+          description: 'WordPress category name - pick the most relevant one from available categories shown in save_content response'
+        }
+      }
+    }
+  },
+  {
+    name: 'get_session',
+    description: 'Get current session state - see what content and images have been created.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  }
+]
+
+/**
+ * Build workflow plan based on user request and available credentials
+ *
+ * ALL data comes from project.config (Supabase database) - NO HARDCODED DEFAULTS
+ */
+/**
+ * Validate project configuration with helpful error messages
+ */
+function validateProjectConfig(config) {
+  const errors = []
+
+  if (!config) {
+    throw new Error('Project configuration not found. Please configure your project in the dashboard.')
+  }
+
+  // Check required fields
+  if (!config.content?.default_word_count) {
+    errors.push('Word count: Not set → Dashboard → Project Settings → Content')
+  } else if (typeof config.content.default_word_count !== 'number' || config.content.default_word_count < 100) {
+    errors.push('Word count: Must be at least 100 words')
+  } else if (config.content.default_word_count > 10000) {
+    errors.push('Word count: Maximum 10,000 words supported')
+  }
+
+  if (!config.brand?.voice) {
+    errors.push('Brand voice: Not set → Dashboard → Project Settings → Brand')
+  }
+
+  if (!config.site?.niche) {
+    errors.push('Niche: Not set → Dashboard → Project Settings → Site')
+  }
+
+  // Warnings (non-blocking but helpful)
+  const warnings = []
+  if (!config.seo?.primary_keywords?.length) {
+    warnings.push('No primary keywords set - content may lack SEO focus')
+  }
+  if (!config.brand?.target_audience) {
+    warnings.push('No target audience set - content may be too generic')
+  }
+
+  if (errors.length > 0) {
+    throw new Error(`Project configuration incomplete:\n${errors.map(e => `  • ${e}`).join('\n')}`)
+  }
+
+  return { warnings }
+}
+
+function buildWorkflowPlan(request, count, publishTo, withImages, project) {
+  const steps = []
+  const hasGhost = hasCredential('ghost')
+  const hasWordPress = hasCredential('wordpress')
+  const hasImageGen = hasCredential('image')
+
+  // Get project config from database - MUST be dynamic, no hardcoding
+  const config = project?.config
+
+  // Validate configuration with helpful messages
+  const { warnings } = validateProjectConfig(config)
+  if (warnings.length > 0) {
+    log(`Config warnings: ${warnings.join('; ')}`)
+  }
+
+  // Extract all settings from project.config (database schema)
+  const targetWordCount = config.content?.default_word_count
+  const readingLevel = config.content?.reading_level
+  const includeImages = config.content?.include_images
+  const brandVoice = config.brand?.voice
+  const targetAudience = config.brand?.target_audience
+  const differentiators = config.brand?.differentiators || []
+  const visualStyle = config.visual_style?.image_aesthetic
+  const brandColors = config.visual_style?.colors || []
+  const primaryKeywords = config.seo?.primary_keywords || []
+  const geoFocus = config.seo?.geo_focus
+  const niche = config.site?.niche
+  const siteName = config.site?.name
+  const siteUrl = config.site?.url
+  const siteDescription = config.site?.description
+
+  // Calculate required images: 1 cover + 1 per 300 words (only if includeImages is true)
+  const shouldGenerateImages = withImages && includeImages && hasImageGen
+  const contentImageCount = shouldGenerateImages ? Math.floor(targetWordCount / 300) : 0
+  const totalImages = shouldGenerateImages ? 1 + contentImageCount : 0 // cover + inline images
+
+  // Format reading level for display (stored as number, display as "Grade X")
+  const readingLevelDisplay = readingLevel ? `Grade ${readingLevel}` : 'Not set'
+
+  // Format keywords for display
+  const keywordsDisplay = primaryKeywords.length > 0 ? primaryKeywords.join(', ') : 'No keywords set'
+
+  // Determine publish targets
+  let targets = publishTo || []
+  if (targets.length === 0 || targets.includes('all')) {
+    targets = []
+    if (hasGhost) targets.push('ghost')
+    if (hasWordPress) targets.push('wordpress')
+  }
+
+  let stepNum = 0
+
+  // Step 1: Keyword Research
+  // Build dynamic MCP hints from local credentials (user-configured in credentials.json)
+  const externalMcps = getExternalMCPs()
+  const keywordResearchHints = getCompositionHints('keyword_research')
+
+  let mcpInstructions = ''
+  if (externalMcps.length > 0) {
+    const mcpList = externalMcps.map(m => `- **${m.name}**: ${m.available_tools?.join(', ') || 'tools available'}`).join('\n')
+    mcpInstructions = `\n💡 **External MCPs Available (from your credentials.json):**\n${mcpList}`
+    if (keywordResearchHints) {
+      mcpInstructions += `\n\n**Integration Hint:** ${keywordResearchHints}`
+    }
+  }
+
+  stepNum++
+  steps.push({
+    step: stepNum,
+    type: 'llm_execute',
+    action: 'keyword_research',
+    instruction: `Research keywords for: "${request}"
+
+**Project Context (from database):**
+- Site: ${siteName} (${siteUrl})
+- Niche: ${niche}
+- Description: ${siteDescription || 'Not set'}
+- Primary keywords: ${keywordsDisplay}
+- Geographic focus: ${geoFocus || 'Global'}
+${mcpInstructions}
+
+**Deliverables:**
+- 1 primary keyword to target (lower difficulty preferred)
+- 3-5 secondary/LSI keywords
+- 2-3 question-based keywords for FAQ section`,
+    store: 'keywords'
+  })
+
+  // Step 2: Content Planning with SEO Meta
+  stepNum++
+  steps.push({
+    step: stepNum,
+    type: 'llm_execute',
+    action: 'content_planning',
+    instruction: `Create a detailed content outline with SEO meta:
+
+**Project Requirements (from database):**
+- Site: ${siteName}
+- Target audience: ${targetAudience || 'Not specified'}
+- Brand voice: ${brandVoice}
+- Brand differentiators: ${differentiators.length > 0 ? differentiators.join(', ') : 'Not set'}
+- Word count: **${targetWordCount} words MINIMUM** (this is required!)
+- Reading level: **${readingLevelDisplay}** (use simple sentences, avoid jargon)
+
+**You MUST create:**
+
+1. **SEO Meta Title** (50-60 characters, include primary keyword)
+2. **SEO Meta Description** (150-160 characters, compelling, include keyword)
+3. **URL Slug** (lowercase, hyphens, keyword-rich)
+4. **Content Outline:**
+   - H1: Main title
+   - 6-8 H2 sections (to achieve ${targetWordCount} words)
+   - H3 subsections where needed
+   - FAQ section with 4-5 questions
+
+${shouldGenerateImages ? `**Image Placeholders:** Mark where ${contentImageCount} inline images should go (1 every ~300 words)
+Use format: [IMAGE: description of what image should show]` : '**Note:** Images disabled for this project.'}`,
+    store: 'outline'
+  })
+
+  // Step 3: Write Content
+  stepNum++
+  steps.push({
+    step: stepNum,
+    type: 'llm_execute',
+    action: 'content_write',
+    instruction: `Write the COMPLETE article following your outline.
+
+**⚠️ CRITICAL REQUIREMENTS (from project database):**
+- Word count: **${targetWordCount} words MINIMUM** - Count your words!
+- Reading level: **${readingLevelDisplay}** - Simple sentences, short paragraphs, no jargon
+- Brand voice: ${brandVoice}
+- Target audience: ${targetAudience || 'General readers'}
+
+**Content Structure:**
+- Engaging hook in first 2 sentences
+- All H2/H3 sections from your outline
+- Statistics, examples, and actionable tips in each section
+${shouldGenerateImages ? '- Image placeholders: [IMAGE: description] where images should go' : ''}
+- FAQ section with 4-5 Q&As
+- Strong conclusion with clear CTA
+
+**After writing, call 'save_content' with:**
+- title: Your SEO-optimized title
+- content: The full article (markdown)
+- keywords: Array of target keywords
+- meta_description: Your 150-160 char meta description
+
+⚠️ DO NOT proceed until you've written ${targetWordCount}+ words!`,
+    store: 'article'
+  })
+
+  // Step 4: Generate Images (if enabled in project settings AND credentials available)
+  if (shouldGenerateImages) {
+    // Format brand colors for image style guidance
+    const colorsDisplay = brandColors.length > 0 ? brandColors.join(', ') : 'Not specified'
+
+    stepNum++
+    steps.push({
+      step: stepNum,
+      type: 'llm_execute',
+      action: 'generate_images',
+      instruction: `Generate ${totalImages} images for the article:
+
+**Required Images:**
+1. **Cover/Hero Image** - Main article header (16:9 aspect ratio)
+${Array.from({length: contentImageCount}, (_, i) => `${i + 2}. **Section Image ${i + 1}** - For content section ${i + 1} (16:9 aspect ratio)`).join('\n')}
+
+**For each image, call 'generate_image' tool with:**
+- prompt: Detailed description based on article content
+- style: ${visualStyle || 'professional minimalist'}
+- aspect_ratio: 16:9
+
+**Visual Style (from project database):**
+- Image aesthetic: ${visualStyle || 'Not specified'}
+- Brand colors: ${colorsDisplay}
+- Keep consistent with ${siteName} brand identity
+
+**Image Style Guide:**
+- Professional, clean aesthetic
+- Relevant to the section topic
+- No text in images
+- Consistent style across all images
+
+After generating, note the URLs - they will be saved automatically for publishing.`,
+      image_count: totalImages,
+      store: 'images'
+    })
+  }
+
+  // Step 5: Publish
+  if (targets.length > 0) {
+    stepNum++
+    steps.push({
+      step: stepNum,
+      type: 'action',
+      action: 'publish',
+      instruction: `Publish the article to: ${targets.join(', ')}
+
+Call 'publish_content' tool - it will automatically use:
+- Saved article title and content
+- SEO meta description
+- Generated images (cover + inline)
+- Target keywords as tags`,
+      targets: targets
+    })
+  }
+
+  return {
+    workflow_id: `wf_${Date.now()}`,
+    request: request,
+    total_articles: count,
+    current_article: 1,
+    total_steps: steps.length,
+    current_step: 1,
+    // All settings come from project.config (database) - no hardcoded values
+    project_info: {
+      name: siteName,
+      url: siteUrl,
+      niche: niche
+    },
+    settings: {
+      target_word_count: targetWordCount,
+      reading_level: readingLevel,
+      reading_level_display: readingLevelDisplay,
+      brand_voice: brandVoice,
+      target_audience: targetAudience,
+      include_images: includeImages,
+      total_images: totalImages,
+      content_images: contentImageCount,
+      visual_style: visualStyle,
+      primary_keywords: primaryKeywords,
+      geo_focus: geoFocus
+    },
+    available_integrations: {
+      external_mcps: externalMcps.map(m => m.name),
+      ghost: hasGhost,
+      wordpress: hasWordPress,
+      image_generation: hasImageGen
+    },
+    steps: steps
+  }
+}
+
+/**
+ * Execute orchestrator tools
+ */
+async function executeOrchestratorTool(toolName, args, project) {
+  switch (toolName) {
+    case 'create_content': {
+      resetSession()
+      const { request = '', count = 1, publish_to = [], with_images = true } = args
+
+      const plan = buildWorkflowPlan(
+        request || `content about ${project?.niche || 'the project topic'}`,
+        count,
+        publish_to,
+        with_images,
+        project
+      )
+
+      sessionState.currentWorkflow = plan
+
+      // Persist session to file for workflow continuity
+      saveSession()
+
+      // Build response with clear instructions - all data from database
+      const mcpList = plan.available_integrations.external_mcps.length > 0
+        ? plan.available_integrations.external_mcps.join(', ')
+        : 'None configured'
+
+      let response = `# 🚀 Content Creation Workflow Started
+
+## Your Request
+"${plan.request}"
+
+## Project: ${plan.project_info.name}
+- **URL:** ${plan.project_info.url}
+- **Niche:** ${plan.project_info.niche}
+
+## Content Settings (from database)
+| Setting | Value |
+|---------|-------|
+| **Word Count** | ${plan.settings.target_word_count} words |
+| **Reading Level** | ${plan.settings.reading_level_display} |
+| **Brand Voice** | ${plan.settings.brand_voice} |
+| **Target Audience** | ${plan.settings.target_audience || 'Not specified'} |
+| **Primary Keywords** | ${plan.settings.primary_keywords?.join(', ') || 'Not set'} |
+| **Geographic Focus** | ${plan.settings.geo_focus || 'Global'} |
+| **Visual Style** | ${plan.settings.visual_style || 'Not specified'} |
+| **Include Images** | ${plan.settings.include_images ? 'Yes' : 'No'} |
+| **Images Required** | ${plan.settings.total_images} (1 cover + ${plan.settings.content_images} inline) |
+
+## Workflow Plan
+${plan.steps.map(s => `${s.step}. **${s.action}** ${s.type === 'action' ? '(automatic)' : '(you execute)'}`).join('\n')}
+
+## Available Integrations (from ~/.suparank/credentials.json)
+- External MCPs: ${mcpList}
+- Image Generation: ${plan.available_integrations.image_generation ? '✅ Ready' : '❌ Not configured'}
+- Ghost CMS: ${plan.available_integrations.ghost ? '✅ Ready' : '❌ Not configured'}
+- WordPress: ${plan.available_integrations.wordpress ? '✅ Ready' : '❌ Not configured'}
+
+---
+
+## Step 1 of ${plan.total_steps}: ${plan.steps[0].action.toUpperCase()}
+
+${plan.steps[0].instruction}
+
+---
+
+**When you complete this step, move to Step 2.**
+`
+
+      return {
+        content: [{
+          type: 'text',
+          text: response
+        }]
+      }
+    }
+
+    case 'save_content': {
+      const { title, content, keywords = [], meta_description = '' } = args
+
+      sessionState.title = title
+      sessionState.article = content
+      sessionState.keywords = keywords
+      sessionState.metaDescription = meta_description
+      sessionState.metadata = { meta_description }
+
+      // Persist session to file and save to content folder
+      saveSession()
+      const contentFolder = saveContentToFolder()
+
+      const wordCount = content.split(/\s+/).length
+      progress('Content', `Saved "${title}" (${wordCount} words)${contentFolder ? ` → ${contentFolder}` : ''}`)
+      const workflow = sessionState.currentWorkflow
+      const targetWordCount = workflow?.settings?.target_word_count
+      const wordCountOk = targetWordCount ? wordCount >= targetWordCount * 0.9 : true // Allow 10% tolerance
+
+      // Find next step
+      const imageStep = workflow?.steps?.find(s => s.action === 'generate_images')
+      const totalImages = workflow?.settings?.total_images || 0
+      const includeImages = workflow?.settings?.include_images
+
+      // Fetch WordPress categories for intelligent assignment
+      let categoriesSection = ''
+      if (hasCredential('wordpress')) {
+        const wpCategories = await fetchWordPressCategories()
+        if (wpCategories && wpCategories.length > 0) {
+          const categoryList = wpCategories
+            .slice(0, 15) // Show top 15 by post count
+            .map(c => `- **${c.name}** (${c.count} posts)${c.description ? `: ${c.description}` : ''}`)
+            .join('\n')
+          categoriesSection = `\n## WordPress Categories Available
+Pick the most relevant category when publishing:
+${categoryList}
+
+When calling \`publish_content\`, include the \`category\` parameter with your choice.\n`
+        }
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: `# ✅ Content Saved to Session
+
+**Title:** ${title}
+**Word Count:** ${wordCount} words ${targetWordCount ? (wordCountOk ? '✅' : `⚠️ (target: ${targetWordCount})`) : '(no target set)'}
+**Meta Description:** ${meta_description ? `${meta_description.length} chars ✅` : '❌ Missing!'}
+**Keywords:** ${keywords.join(', ') || 'none specified'}
+
+${targetWordCount && !wordCountOk ? `⚠️ **Warning:** Article is ${targetWordCount - wordCount} words short of the ${targetWordCount} word target.\n` : ''}
+${!meta_description ? '⚠️ **Warning:** Meta description is missing. Add it for better SEO.\n' : ''}
+${categoriesSection}
+## Next Step${includeImages && imageStep ? ': Generate Images' : ': Publish'}
+${includeImages && imageStep ? `Generate **${totalImages} images** (1 cover + ${totalImages - 1} inline images).
+
+Call \`generate_image\` ${totalImages} times with prompts based on your article sections.` : 'Proceed to publish with \`publish_content\`.'}`
+        }]
+      }
+    }
+
+    case 'publish_content': {
+      const { platforms = ['all'], status = 'draft', category = '' } = args
+
+      if (!sessionState.article || !sessionState.title) {
+        return {
+          content: [{
+            type: 'text',
+            text: '❌ No content saved. Please use save_content first to save your article.'
+          }]
+        }
+      }
+
+      // Inject inline images into content (replace [IMAGE: ...] placeholders)
+      let contentWithImages = sessionState.article
+      let imageIndex = 0
+      contentWithImages = contentWithImages.replace(/\[IMAGE:\s*([^\]]+)\]/gi, (match, description) => {
+        if (imageIndex < sessionState.inlineImages.length) {
+          const imgUrl = sessionState.inlineImages[imageIndex]
+          imageIndex++
+          return `![${description.trim()}](${imgUrl})`
+        }
+        return match // Keep placeholder if no image available
+      })
+
+      const results = []
+      const hasGhost = hasCredential('ghost')
+      const hasWordPress = hasCredential('wordpress')
+
+      const shouldPublishGhost = hasGhost && (platforms.includes('all') || platforms.includes('ghost'))
+      const shouldPublishWordPress = hasWordPress && (platforms.includes('all') || platforms.includes('wordpress'))
+
+      // Publish to Ghost
+      if (shouldPublishGhost) {
+        try {
+          const ghostResult = await executeGhostPublish({
+            title: sessionState.title,
+            content: contentWithImages,
+            status: status,
+            tags: sessionState.keywords || [],
+            featured_image_url: sessionState.imageUrl
+          })
+          results.push({ platform: 'Ghost', success: true, result: ghostResult })
+        } catch (e) {
+          results.push({ platform: 'Ghost', success: false, error: e.message })
+        }
+      }
+
+      // Publish to WordPress with intelligent category assignment
+      if (shouldPublishWordPress) {
+        try {
+          // Use selected category or empty array
+          const categories = category ? [category] : []
+          log(`Publishing to WordPress with category: ${category || '(none selected)'}`)
+
+          const wpResult = await executeWordPressPublish({
+            title: sessionState.title,
+            content: contentWithImages,
+            status: status,
+            categories: categories,
+            tags: sessionState.keywords || [],
+            featured_image_url: sessionState.imageUrl
+          })
+          results.push({ platform: 'WordPress', success: true, result: wpResult, category: category || null })
+        } catch (e) {
+          results.push({ platform: 'WordPress', success: false, error: e.message })
+        }
+      }
+
+      // Format response
+      const wordCount = contentWithImages.split(/\s+/).length
+      const inlineImagesUsed = imageIndex
+
+      let response = `# 📤 Publishing Results
+
+## Content Summary
+- **Title:** ${sessionState.title}
+- **Word Count:** ${wordCount} words
+- **Meta Description:** ${sessionState.metaDescription ? '✅ Included' : '❌ Missing'}
+- **Cover Image:** ${sessionState.imageUrl ? '✅ Set' : '❌ Missing'}
+- **Inline Images:** ${inlineImagesUsed} injected into content
+- **Keywords/Tags:** ${sessionState.keywords?.join(', ') || 'None'}
+- **Category:** ${category || 'Not specified'}
+
+`
+
+      for (const r of results) {
+        if (r.success) {
+          response += `## ✅ ${r.platform}\n${r.result.content[0].text}\n\n`
+        } else {
+          response += `## ❌ ${r.platform}\nError: ${r.error}\n\n`
+        }
+      }
+
+      if (results.length === 0) {
+        response += `No platforms configured or selected for publishing.\n`
+        response += `Available: Ghost (${hasGhost ? 'yes' : 'no'}), WordPress (${hasWordPress ? 'yes' : 'no'})`
+      }
+
+      // Clear session after successful publish (at least one success)
+      const hasSuccessfulPublish = results.some(r => r.success)
+      if (hasSuccessfulPublish) {
+        clearSessionFile()
+        resetSession()
+        response += '\n---\n✅ Session cleared. Ready for new content.'
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: response
+        }]
+      }
+    }
+
+    case 'get_session': {
+      const totalImagesNeeded = sessionState.currentWorkflow?.settings?.total_images || 0
+      const imagesGenerated = (sessionState.imageUrl ? 1 : 0) + sessionState.inlineImages.length
+      const workflow = sessionState.currentWorkflow
+
+      return {
+        content: [{
+          type: 'text',
+          text: `# 📋 Current Session State
+
+**Workflow:** ${workflow?.workflow_id || 'None active'}
+
+## Content
+**Title:** ${sessionState.title || 'Not set'}
+**Article:** ${sessionState.article ? `${sessionState.article.split(/\s+/).length} words` : 'Not saved'}
+**Meta Description:** ${sessionState.metaDescription || 'Not set'}
+**Keywords:** ${sessionState.keywords?.join(', ') || 'None'}
+
+## Images (${imagesGenerated}/${totalImagesNeeded})
+**Cover Image:** ${sessionState.imageUrl || 'Not generated'}
+**Inline Images:** ${sessionState.inlineImages.length > 0 ? sessionState.inlineImages.map((url, i) => `\n  ${i+1}. ${url}`).join('') : 'None'}
+
+${workflow ? `
+## Project Settings (from database)
+- **Project:** ${workflow.project_info?.name || 'Unknown'}
+- **Niche:** ${workflow.project_info?.niche || 'Unknown'}
+- **Word Count Target:** ${workflow.settings?.target_word_count || 'Not set'}
+- **Reading Level:** ${workflow.settings?.reading_level_display || 'Not set'}
+- **Brand Voice:** ${workflow.settings?.brand_voice || 'Not set'}
+- **Visual Style:** ${workflow.settings?.visual_style || 'Not set'}
+- **Include Images:** ${workflow.settings?.include_images ? 'Yes' : 'No'}
+- **Total Images:** ${totalImagesNeeded}
+` : ''}`
+        }]
+      }
+    }
+
+    default:
+      throw new Error(`Unknown orchestrator tool: ${toolName}`)
+  }
+}
+
+/**
+ * Execute an action tool locally using credentials
+ */
+async function executeActionTool(toolName, args) {
+  switch (toolName) {
+    case 'generate_image':
+      return await executeImageGeneration(args)
+    case 'publish_wordpress':
+      return await executeWordPressPublish(args)
+    case 'publish_ghost':
+      return await executeGhostPublish(args)
+    case 'send_webhook':
+      return await executeSendWebhook(args)
+    default:
+      throw new Error(`Unknown action tool: ${toolName}`)
+  }
+}
+
+/**
+ * Generate image using configured provider
+ */
+async function executeImageGeneration(args) {
+  const provider = localCredentials.image_provider
+  const config = localCredentials[provider]
+
+  if (!config?.api_key) {
+    throw new Error(`${provider} API key not configured`)
+  }
+
+  progress('Image', `Generating with ${provider}...`)
+
+  const { prompt, style, aspect_ratio = '16:9' } = args
+  const fullPrompt = style ? `${prompt}, ${style}` : prompt
+
+  log(`Generating image with ${provider}: ${fullPrompt.substring(0, 50)}...`)
+
+  switch (provider) {
+    case 'fal': {
+      // fal.ai Nano Banana Pro (gemini-3-pro-image)
+      const response = await fetchWithRetry('https://fal.run/fal-ai/nano-banana-pro', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Key ${config.api_key}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          prompt: fullPrompt,
+          aspect_ratio: aspect_ratio,
+          output_format: 'png',
+          resolution: '1K',
+          num_images: 1
+        })
+      }, 2, 60000) // 2 retries, 60s timeout for image generation
+
+      if (!response.ok) {
+        const error = await response.text()
+        throw new Error(`fal.ai error: ${error}`)
+      }
+
+      const result = await response.json()
+      const imageUrl = result.images?.[0]?.url
+
+      // Store in session for orchestrated workflows
+      // First image is cover, subsequent are inline
+      if (!sessionState.imageUrl) {
+        sessionState.imageUrl = imageUrl
+      } else {
+        sessionState.inlineImages.push(imageUrl)
+      }
+
+      // Persist session to file
+      saveSession()
+
+      const imageNumber = 1 + sessionState.inlineImages.length
+      const totalImages = sessionState.currentWorkflow?.settings?.total_images || 1
+      const imageType = imageNumber === 1 ? 'Cover Image' : `Inline Image ${imageNumber - 1}`
+
+      return {
+        content: [{
+          type: 'text',
+          text: `# ✅ ${imageType} Generated (${imageNumber}/${totalImages})
+
+**URL:** ${imageUrl}
+
+**Prompt:** ${fullPrompt}
+**Provider:** fal.ai (nano-banana-pro)
+**Aspect Ratio:** ${aspect_ratio}
+
+${imageNumber < totalImages ? `\n**Next:** Generate ${totalImages - imageNumber} more image(s).` : '\n**All images generated!** Proceed to publish.'}`
+        }]
+      }
+    }
+
+    case 'gemini': {
+      // Google Gemini 3 Pro Image (Nano Banana Pro) - generateContent API
+      const model = config.model || 'gemini-3-pro-image-preview'
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': config.api_key
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{ text: fullPrompt }]
+            }],
+            generationConfig: {
+              responseModalities: ['IMAGE'],
+              imageConfig: {
+                aspectRatio: aspect_ratio,
+                imageSize: '1K'
+              }
+            }
+          })
+        }
+      )
+
+      if (!response.ok) {
+        const error = await response.text()
+        throw new Error(`Gemini error: ${error}`)
+      }
+
+      const result = await response.json()
+      const imagePart = result.candidates?.[0]?.content?.parts?.find(p => p.inlineData)
+      const imageData = imagePart?.inlineData?.data
+      const mimeType = imagePart?.inlineData?.mimeType || 'image/png'
+
+      if (!imageData) {
+        throw new Error('No image data in Gemini response')
+      }
+
+      // Return base64 data URI
+      const dataUri = `data:${mimeType};base64,${imageData}`
+
+      return {
+        content: [{
+          type: 'text',
+          text: `Image generated successfully!\n\n**Format:** Base64 Data URI\n**Prompt:** ${fullPrompt}\n**Provider:** Google Gemini (${model})\n**Aspect Ratio:** ${aspect_ratio}\n\n**Data URI:** ${dataUri.substring(0, 100)}...\n\n[Full base64 data: ${imageData.length} chars]`
+        }]
+      }
+    }
+
+    case 'wiro': {
+      // wiro.ai API with HMAC signature authentication
+      const crypto = await import('crypto')
+      const apiKey = config.api_key
+      const apiSecret = config.api_secret
+
+      if (!apiSecret) {
+        throw new Error('Wiro API secret not configured. Add api_secret to wiro config in ~/.suparank/credentials.json')
+      }
+
+      // Generate nonce and signature
+      const nonce = Math.floor(Date.now() / 1000).toString()
+      const signatureData = `${apiSecret}${nonce}`
+      const signature = crypto.createHmac('sha256', apiKey)
+        .update(signatureData)
+        .digest('hex')
+
+      const model = config.model || 'google/nano-banana-pro'
+
+      // Submit task
+      log(`Submitting wiro.ai task for model: ${model}`)
+      const submitResponse = await fetch(`https://api.wiro.ai/v1/Run/${model}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'x-nonce': nonce,
+          'x-signature': signature
+        },
+        body: JSON.stringify({
+          prompt: fullPrompt,
+          aspectRatio: aspect_ratio,
+          resolution: '1K',
+          safetySetting: 'BLOCK_ONLY_HIGH'
+        })
+      })
+
+      if (!submitResponse.ok) {
+        const error = await submitResponse.text()
+        throw new Error(`wiro.ai submit error: ${error}`)
+      }
+
+      const submitResult = await submitResponse.json()
+      if (!submitResult.result || !submitResult.taskid) {
+        throw new Error(`wiro.ai task submission failed: ${JSON.stringify(submitResult.errors)}`)
+      }
+
+      const taskId = submitResult.taskid
+      log(`wiro.ai task submitted: ${taskId}`)
+
+      // Poll for completion
+      const maxAttempts = 60 // 60 seconds max
+      const pollInterval = 2000 // 2 seconds
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, pollInterval))
+
+        // Generate new signature for poll request
+        const pollNonce = Math.floor(Date.now() / 1000).toString()
+        const pollSignatureData = `${apiSecret}${pollNonce}`
+        const pollSignature = crypto.createHmac('sha256', apiKey)
+          .update(pollSignatureData)
+          .digest('hex')
+
+        const pollResponse = await fetch('https://api.wiro.ai/v1/Task/Detail', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'x-nonce': pollNonce,
+            'x-signature': pollSignature
+          },
+          body: JSON.stringify({ taskid: taskId })
+        })
+
+        if (!pollResponse.ok) {
+          log(`wiro.ai poll error: ${await pollResponse.text()}`)
+          continue
+        }
+
+        const pollResult = await pollResponse.json()
+        const task = pollResult.tasklist?.[0]
+
+        if (!task) continue
+
+        const status = task.status
+        log(`wiro.ai task status: ${status}`)
+
+        // Check for completion
+        if (status === 'task_postprocess_end') {
+          const imageUrl = task.outputs?.[0]?.url
+          if (!imageUrl) {
+            throw new Error('wiro.ai task completed but no output URL')
+          }
+
+          // Store in session for orchestrated workflows
+          // First image is cover, subsequent are inline
+          if (!sessionState.imageUrl) {
+            sessionState.imageUrl = imageUrl
+          } else {
+            sessionState.inlineImages.push(imageUrl)
+          }
+
+          // Persist session to file
+          saveSession()
+
+          const imageNumber = 1 + sessionState.inlineImages.length
+          const totalImages = sessionState.currentWorkflow?.settings?.total_images || 1
+          const imageType = imageNumber === 1 ? 'Cover Image' : `Inline Image ${imageNumber - 1}`
+
+          return {
+            content: [{
+              type: 'text',
+              text: `# ✅ ${imageType} Generated (${imageNumber}/${totalImages})
+
+**URL:** ${imageUrl}
+
+**Prompt:** ${fullPrompt}
+**Provider:** wiro.ai (${model})
+**Aspect Ratio:** ${aspect_ratio}
+**Processing Time:** ${task.elapsedseconds}s
+
+${imageNumber < totalImages ? `\n**Next:** Generate ${totalImages - imageNumber} more image(s).` : '\n**All images generated!** Proceed to publish.'}`
+            }]
+          }
+        }
+
+        // Check for failure
+        if (status === 'task_cancel') {
+          throw new Error('wiro.ai task was cancelled')
+        }
+      }
+
+      throw new Error('wiro.ai task timed out after 60 seconds')
+    }
+
+    default:
+      throw new Error(`Unknown image provider: ${provider}`)
+  }
+}
+
+/**
+ * Convert aspect ratio string to fal.ai image size
+ */
+function aspectRatioToSize(ratio) {
+  const sizes = {
+    '1:1': 'square',
+    '16:9': 'landscape_16_9',
+    '9:16': 'portrait_16_9',
+    '4:3': 'landscape_4_3',
+    '3:4': 'portrait_4_3'
+  }
+  return sizes[ratio] || 'landscape_16_9'
+}
+
+/**
+ * Convert markdown to HTML using marked library
+ * Configured for WordPress/Ghost CMS compatibility
+ */
+function markdownToHtml(markdown) {
+  // Configure marked for CMS compatibility
+  marked.setOptions({
+    gfm: true,        // GitHub Flavored Markdown
+    breaks: true,     // Convert line breaks to <br>
+    pedantic: false,
+    silent: true      // Don't throw on errors
+  })
+
+  try {
+    return marked.parse(markdown)
+  } catch (error) {
+    log(`Markdown conversion error: ${error.message}`)
+    // Fallback: return markdown wrapped in <p> tags
+    return `<p>${markdown.replace(/\n\n+/g, '</p><p>')}</p>`
+  }
+}
+
+/**
+ * Fetch available categories from WordPress
+ */
+async function fetchWordPressCategories() {
+  const wpConfig = localCredentials?.wordpress
+  if (!wpConfig?.secret_key || !wpConfig?.site_url) {
+    return null
+  }
+
+  try {
+    log('Fetching WordPress categories...')
+
+    // Try new Suparank endpoint first, then fall back to legacy
+    const endpoints = [
+      { url: `${wpConfig.site_url}/wp-json/suparank/v1/categories`, header: 'X-Suparank-Key' },
+      { url: `${wpConfig.site_url}/wp-json/writer-mcp/v1/categories`, header: 'X-Writer-MCP-Key' }
+    ]
+
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetchWithTimeout(endpoint.url, {
+          method: 'GET',
+          headers: {
+            [endpoint.header]: wpConfig.secret_key
+          }
+        }, 10000) // 10s timeout
+
+        if (response.ok) {
+          const result = await response.json()
+          if (result.success && result.categories) {
+            log(`Found ${result.categories.length} WordPress categories`)
+            return result.categories
+          }
+        }
+      } catch (e) {
+        // Try next endpoint
+      }
+    }
+
+    log('Failed to fetch categories from any endpoint')
+    return null
+  } catch (error) {
+    log(`Error fetching categories: ${error.message}`)
+    return null
+  }
+}
+
+/**
+ * Publish to WordPress using REST API or custom plugin
+ */
+async function executeWordPressPublish(args) {
+  const wpConfig = localCredentials.wordpress
+  const { title, content, status = 'draft', categories = [], tags = [], featured_image_url } = args
+
+  progress('Publish', `Publishing to WordPress: "${title}"`)
+  log(`Publishing to WordPress: ${title}`)
+
+  // Convert markdown to HTML for WordPress
+  const htmlContent = markdownToHtml(content)
+
+  // Method 1: Use Suparank Connector plugin (secret_key auth)
+  if (wpConfig.secret_key) {
+    log('Using Suparank/Writer MCP Connector plugin')
+
+    // Try new Suparank endpoint first, then fall back to legacy
+    const endpoints = [
+      { url: `${wpConfig.site_url}/wp-json/suparank/v1/publish`, header: 'X-Suparank-Key' },
+      { url: `${wpConfig.site_url}/wp-json/writer-mcp/v1/publish`, header: 'X-Writer-MCP-Key' }
+    ]
+
+    const postBody = JSON.stringify({
+      title,
+      content: htmlContent,
+      status,
+      categories,
+      tags,
+      featured_image_url,
+      excerpt: sessionState.metaDescription || ''
+    })
+
+    let lastError = null
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetchWithRetry(endpoint.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            [endpoint.header]: wpConfig.secret_key
+          },
+          body: postBody
+        }, 2, 30000) // 2 retries, 30s timeout
+
+        if (response.ok) {
+          const result = await response.json()
+
+          if (result.success) {
+            const categoriesInfo = result.post.categories?.length
+              ? `\n**Categories:** ${result.post.categories.join(', ')}`
+              : ''
+            const tagsInfo = result.post.tags?.length
+              ? `\n**Tags:** ${result.post.tags.join(', ')}`
+              : ''
+            const imageInfo = result.post.featured_image
+              ? `\n**Featured Image:** ✅ Uploaded`
+              : ''
+
+            return {
+              content: [{
+                type: 'text',
+                text: `Post published to WordPress!\n\n**Title:** ${result.post.title}\n**Status:** ${result.post.status}\n**URL:** ${result.post.url}\n**Edit:** ${result.post.edit_url}\n**ID:** ${result.post.id}${categoriesInfo}${tagsInfo}${imageInfo}\n\n${status === 'draft' ? 'The post is saved as a draft. Edit and publish from WordPress dashboard.' : 'The post is now live!'}`
+              }]
+            }
+          }
+        }
+        lastError = await response.text()
+      } catch (e) {
+        lastError = e.message
+      }
+    }
+
+    throw new Error(`WordPress error: ${lastError}`)
+  }
+
+  // Method 2: Use standard REST API with application password
+  if (wpConfig.app_password && wpConfig.username) {
+    log('Using WordPress REST API with application password')
+
+    const auth = Buffer.from(`${wpConfig.username}:${wpConfig.app_password}`).toString('base64')
+    const postData = {
+      title,
+      content: htmlContent,
+      status,
+      categories: [],
+      tags: []
+    }
+
+    const response = await fetch(`${wpConfig.site_url}/wp-json/wp/v2/posts`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(postData)
+    })
+
+    if (!response.ok) {
+      const error = await response.text()
+      throw new Error(`WordPress error: ${error}`)
+    }
+
+    const post = await response.json()
+
+    return {
+      content: [{
+        type: 'text',
+        text: `Post published to WordPress!\n\n**Title:** ${post.title.rendered}\n**Status:** ${post.status}\n**URL:** ${post.link}\n**ID:** ${post.id}\n\n${status === 'draft' ? 'The post is saved as a draft. Edit and publish from WordPress dashboard.' : 'The post is now live!'}`
+      }]
+    }
+  }
+
+  throw new Error('WordPress credentials not configured. Add either secret_key (with plugin) or username + app_password to ~/.suparank/credentials.json')
+}
+
+/**
+ * Publish to Ghost using Admin API
+ */
+async function executeGhostPublish(args) {
+  const { api_url, admin_api_key } = localCredentials.ghost
+  const { title, content, status = 'draft', tags = [], featured_image_url } = args
+
+  progress('Publish', `Publishing to Ghost: "${title}"`)
+  log(`Publishing to Ghost: ${title}`)
+
+  // Create JWT for Ghost Admin API
+  const [id, secret] = admin_api_key.split(':')
+  const token = await createGhostJWT(id, secret)
+
+  // Convert markdown to HTML for proper element separation
+  const htmlContent = markdownToHtml(content)
+
+  // Use HTML card for proper rendering (each element separate)
+  const mobiledoc = JSON.stringify({
+    version: '0.3.1',
+    atoms: [],
+    cards: [['html', { html: htmlContent }]],
+    markups: [],
+    sections: [[10, 0]]
+  })
+
+  const postData = {
+    posts: [{
+      title,
+      mobiledoc,
+      status,
+      tags: tags.map(name => ({ name })),
+      feature_image: featured_image_url
+    }]
+  }
+
+  const response = await fetchWithRetry(`${api_url}/ghost/api/admin/posts/`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Ghost ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(postData)
+  }, 2, 30000) // 2 retries, 30s timeout
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`Ghost error: ${error}`)
+  }
+
+  const result = await response.json()
+  const post = result.posts[0]
+
+  return {
+    content: [{
+      type: 'text',
+      text: `Post published to Ghost!\n\n**Title:** ${post.title}\n**Status:** ${post.status}\n**URL:** ${post.url}\n**ID:** ${post.id}\n\n${status === 'draft' ? 'The post is saved as a draft. Edit and publish from Ghost dashboard.' : 'The post is now live!'}`
+    }]
+  }
+}
+
+/**
+ * Create JWT for Ghost Admin API
+ */
+async function createGhostJWT(id, secret) {
+  // Simple JWT creation for Ghost
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid: id })).toString('base64url')
+  const now = Math.floor(Date.now() / 1000)
+  const payload = Buffer.from(JSON.stringify({
+    iat: now,
+    exp: now + 300, // 5 minutes
+    aud: '/admin/'
+  })).toString('base64url')
+
+  // Create signature using crypto
+  const crypto = await import('crypto')
+  const key = Buffer.from(secret, 'hex')
+  const signature = crypto.createHmac('sha256', key)
+    .update(`${header}.${payload}`)
+    .digest('base64url')
+
+  return `${header}.${payload}.${signature}`
+}
+
+/**
+ * Send data to webhook
+ */
+async function executeSendWebhook(args) {
+  const { webhook_type = 'default', payload = {}, message } = args
+  const webhooks = localCredentials.webhooks
+
+  // Get webhook URL
+  const urlMap = {
+    default: webhooks.default_url,
+    make: webhooks.make_url,
+    n8n: webhooks.n8n_url,
+    zapier: webhooks.zapier_url,
+    slack: webhooks.slack_url
+  }
+
+  const url = urlMap[webhook_type]
+  if (!url) {
+    throw new Error(`No ${webhook_type} webhook URL configured`)
+  }
+
+  log(`Sending webhook to ${webhook_type}: ${url}`)
+
+  // Format payload based on type
+  let body
+  let headers = { 'Content-Type': 'application/json' }
+
+  if (webhook_type === 'slack') {
+    body = JSON.stringify({
+      text: message || 'Message from Writer MCP',
+      ...payload
+    })
+  } else {
+    body = JSON.stringify({
+      source: 'suparank',
+      timestamp: new Date().toISOString(),
+      project: projectSlug,
+      data: payload,
+      message
+    })
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body
+  })
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`Webhook error (${response.status}): ${error}`)
+  }
+
+  return {
+    content: [{
+      type: 'text',
+      text: `Webhook sent successfully!\n\n**Type:** ${webhook_type}\n**URL:** ${url.substring(0, 50)}...\n**Status:** ${response.status}\n\nThe data has been sent to your ${webhook_type} webhook.`
+    }]
+  }
+}
+
+/**
+ * Get all available tools based on configured credentials
+ */
+function getAvailableTools() {
+  const tools = [...TOOLS]
+
+  // Add orchestrator tools (always available)
+  for (const tool of ORCHESTRATOR_TOOLS) {
+    tools.push({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema
+    })
+  }
+
+  // Add action tools only if credentials are configured
+  for (const tool of ACTION_TOOLS) {
+    if (hasCredential(tool.requiresCredential)) {
+      tools.push({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema
+      })
+    } else {
+      // Add disabled version with note
+      tools.push({
+        name: tool.name,
+        description: `[DISABLED - requires ${tool.requiresCredential} credentials] ${tool.description}`,
+        inputSchema: tool.inputSchema
+      })
+    }
+  }
+
+  return tools
+}
+
+// Main function
+async function main() {
+  log(`Starting MCP client for project: ${projectSlug}`)
+  log(`API URL: ${apiUrl}`)
+
+  // Load local credentials
+  localCredentials = loadLocalCredentials()
+  if (localCredentials) {
+    const configured = []
+    if (hasCredential('wordpress')) configured.push('wordpress')
+    if (hasCredential('ghost')) configured.push('ghost')
+    if (hasCredential('image')) configured.push(`image:${localCredentials.image_provider}`)
+    if (hasCredential('webhooks')) configured.push('webhooks')
+    if (localCredentials.external_mcps?.length) {
+      configured.push(`mcps:${localCredentials.external_mcps.map(m => m.name).join(',')}`)
+    }
+    if (configured.length > 0) {
+      log(`Configured integrations: ${configured.join(', ')}`)
+    }
+  }
+
+  // Restore session state from previous run
+  if (loadSession()) {
+    progress('Session', 'Restored previous workflow state')
+  }
+
+  // Fetch project configuration
+  progress('Init', 'Connecting to platform...')
+  let project
+  try {
+    project = await fetchProjectConfig()
+    progress('Init', `Connected to project: ${project.name}`)
+  } catch (error) {
+    log('Failed to load project config. Exiting.')
+    process.exit(1)
+  }
+
+  // Create MCP server
+  const server = new Server(
+    {
+      name: 'suparank',
+      version: '1.0.0'
+    },
+    {
+      capabilities: {
+        tools: {}
+      }
+    }
+  )
+
+  // Handle initialization
+  server.setRequestHandler(InitializeRequestSchema, async (request) => {
+    log('Received initialize request')
+    return {
+      protocolVersion: '2024-11-05',
+      capabilities: {
+        tools: {}
+      },
+      serverInfo: {
+        name: 'suparank',
+        version: '1.0.0'
+      }
+    }
+  })
+
+  // Handle tools list
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    log('Received list tools request')
+    const tools = getAvailableTools()
+    log(`Returning ${tools.length} tools (${ACTION_TOOLS.length} action tools)`)
+    return { tools }
+  })
+
+  // Handle tool calls
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params
+    progress('Tool', `Executing ${name}`)
+    log(`Executing tool: ${name}`)
+
+    // Check if this is an orchestrator tool
+    const orchestratorTool = ORCHESTRATOR_TOOLS.find(t => t.name === name)
+
+    if (orchestratorTool) {
+      try {
+        const result = await executeOrchestratorTool(name, args || {}, project)
+        log(`Orchestrator tool ${name} completed successfully`)
+        return result
+      } catch (error) {
+        log(`Orchestrator tool ${name} failed:`, error.message)
+        return {
+          content: [{
+            type: 'text',
+            text: `Error executing ${name}: ${error.message}`
+          }]
+        }
+      }
+    }
+
+    // Check if this is an action tool
+    const actionTool = ACTION_TOOLS.find(t => t.name === name)
+
+    if (actionTool) {
+      // Check credentials
+      if (!hasCredential(actionTool.requiresCredential)) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Error: ${name} requires ${actionTool.requiresCredential} credentials.\n\nTo enable this tool:\n1. Run: npx suparank setup\n2. Add your ${actionTool.requiresCredential} credentials to ~/.suparank/credentials.json\n3. Restart the MCP server\n\nSee dashboard Settings > Credentials for setup instructions.`
+          }]
+        }
+      }
+
+      // Execute action tool locally
+      try {
+        const result = await executeActionTool(name, args || {})
+        log(`Action tool ${name} completed successfully`)
+        return result
+      } catch (error) {
+        log(`Action tool ${name} failed:`, error.message)
+        return {
+          content: [{
+            type: 'text',
+            text: `Error executing ${name}: ${error.message}`
+          }]
+        }
+      }
+    }
+
+    // Regular tool - call backend
+    try {
+      // Add composition hints if configured
+      const hints = getCompositionHints(name)
+      const externalMcps = getExternalMCPs()
+
+      const result = await callBackendTool(name, args || {})
+
+      // Inject composition hints into response if available
+      if (hints && result.content && result.content[0]?.text) {
+        const mcpList = externalMcps.length > 0
+          ? `\n\n## External MCPs Available\n${externalMcps.map(m => `- **${m.name}**: ${m.available_tools.join(', ')}`).join('\n')}`
+          : ''
+
+        result.content[0].text = result.content[0].text +
+          `\n\n---\n## Integration Hints\n${hints}${mcpList}`
+      }
+
+      log(`Tool ${name} completed successfully`)
+      return result
+    } catch (error) {
+      log(`Tool ${name} failed:`, error.message)
+      throw error
+    }
+  })
+
+  // Error handler
+  server.onerror = (error) => {
+    log('Server error:', error)
+  }
+
+  // Connect to stdio transport
+  const transport = new StdioServerTransport()
+  await server.connect(transport)
+
+  log('MCP server ready and listening on stdio')
+}
+
+// Run
+main().catch((error) => {
+  log('Fatal error:', error)
+  process.exit(1)
+})
