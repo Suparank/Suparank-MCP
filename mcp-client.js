@@ -47,12 +47,10 @@ if (!apiKey) {
   console.error('Usage: node mcp-client.js <project-slug> <api-key>')
   console.error('')
   console.error('To create an API key:')
-  console.error('1. Sign in at https://suparank.io/dashboard')
+  console.error('1. Sign in to the dashboard at http://localhost:3001')
   console.error('2. Go to Settings > API Keys')
   console.error('3. Click "Create API Key"')
   console.error('4. Copy the key (shown only once!)')
-  console.error('')
-  console.error('Or run: npx suparank setup')
   process.exit(1)
 }
 
@@ -74,9 +72,16 @@ const progress = (step, message) => console.error(`[suparank] ${step}: ${message
 let localCredentials = null
 
 // Session state for orchestration - stores content between steps
+// Supports multiple articles for batch content creation workflows
 const sessionState = {
   currentWorkflow: null,
   stepResults: {},
+
+  // Multi-article support: Array of saved articles
+  articles: [],
+
+  // Current working article (being edited/created)
+  // These fields are for the article currently being worked on
   article: null,
   title: null,
   imageUrl: null,        // Cover image
@@ -85,7 +90,15 @@ const sessionState = {
   metadata: null,
   metaTitle: null,
   metaDescription: null,
+
   contentFolder: null    // Path to saved content folder
+}
+
+/**
+ * Generate a unique article ID
+ */
+function generateArticleId() {
+  return `art_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
 }
 
 /**
@@ -219,6 +232,7 @@ async function fetchWithRetry(url, options = {}, maxRetries = 3, timeoutMs = 300
 
 /**
  * Load session state from file (survives MCP restarts)
+ * Supports both old single-article format and new multi-article format
  */
 function loadSession() {
   try {
@@ -239,6 +253,30 @@ function loadSession() {
       // Restore session state
       sessionState.currentWorkflow = saved.currentWorkflow || null
       sessionState.stepResults = saved.stepResults || {}
+
+      // Load articles array (new format)
+      sessionState.articles = saved.articles || []
+
+      // Backwards compatibility: migrate old single-article format to articles array
+      if (!saved.articles && saved.article && saved.title) {
+        const migratedArticle = {
+          id: generateArticleId(),
+          title: saved.title,
+          content: saved.article,
+          keywords: saved.keywords || [],
+          metaDescription: saved.metaDescription || '',
+          metaTitle: saved.metaTitle || saved.title,
+          imageUrl: saved.imageUrl || null,
+          inlineImages: saved.inlineImages || [],
+          savedAt: saved.savedAt,
+          published: false,
+          publishedTo: []
+        }
+        sessionState.articles = [migratedArticle]
+        log(`Migrated old session format to multi-article format`)
+      }
+
+      // Current working article fields (cleared after each save)
       sessionState.article = saved.article || null
       sessionState.title = saved.title || null
       sessionState.imageUrl = saved.imageUrl || null
@@ -250,12 +288,22 @@ function loadSession() {
       sessionState.contentFolder = saved.contentFolder || null
 
       log(`Restored session from ${sessionFile}`)
-      if (sessionState.title) {
-        log(`  - Article: "${sessionState.title}" (${sessionState.article?.split(/\s+/).length || 0} words)`)
+
+      // Show all saved articles
+      if (sessionState.articles.length > 0) {
+        log(`  - ${sessionState.articles.length} article(s) in session:`)
+        sessionState.articles.forEach((art, i) => {
+          const wordCount = art.content?.split(/\s+/).length || 0
+          const status = art.published ? `published to ${art.publishedTo.join(', ')}` : 'unpublished'
+          log(`    ${i + 1}. "${art.title}" (${wordCount} words) - ${status}`)
+        })
       }
-      if (sessionState.imageUrl) {
-        log(`  - Cover image: ${sessionState.imageUrl.substring(0, 50)}...`)
+
+      // Show current working article if different
+      if (sessionState.title && !sessionState.articles.find(a => a.title === sessionState.title)) {
+        log(`  - Current working: "${sessionState.title}" (${sessionState.article?.split(/\s+/).length || 0} words)`)
       }
+
       if (sessionState.contentFolder) {
         log(`  - Content folder: ${sessionState.contentFolder}`)
       }
@@ -279,6 +327,9 @@ function saveSession() {
     const toSave = {
       currentWorkflow: sessionState.currentWorkflow,
       stepResults: sessionState.stepResults,
+      // Multi-article support
+      articles: sessionState.articles,
+      // Current working article (for backwards compat and active editing)
       article: sessionState.article,
       title: sessionState.title,
       imageUrl: sessionState.imageUrl,
@@ -293,11 +344,61 @@ function saveSession() {
 
     // Atomic write to prevent corruption
     atomicWriteSync(sessionFile, JSON.stringify(toSave, null, 2))
-    progress('Session', `Saved to ${sessionFile}`)
+    progress('Session', `Saved to ${sessionFile} (${sessionState.articles.length} articles)`)
   } catch (error) {
     log(`Warning: Failed to save session: ${error.message}`)
     progress('Session', `FAILED to save: ${error.message}`)
   }
+}
+
+/**
+ * Extract image prompts from article content
+ * Uses H2 headings to create contextual image prompts
+ * @param {string} content - Article content in markdown
+ * @param {object} projectConfig - Project configuration from database
+ * @returns {Array<{heading: string, prompt: string}>} - Array of image prompts
+ */
+function extractImagePromptsFromArticle(content, projectConfig) {
+  // Extract H2 headings from markdown
+  const headings = content.match(/^## .+$/gm) || []
+
+  // Get visual style from project config
+  const visualStyle = projectConfig?.visual_style?.image_aesthetic || 'professional minimalist'
+  const brandColors = projectConfig?.visual_style?.colors || []
+  const brandVoice = projectConfig?.brand?.voice || 'professional'
+  const niche = projectConfig?.site?.niche || ''
+
+  // Limit to 4 images (1 hero + 3 section images)
+  const selectedHeadings = headings.slice(0, 4)
+
+  return selectedHeadings.map((heading, index) => {
+    const topic = heading.replace(/^## /, '').trim()
+
+    // Create contextual prompt based on heading
+    let prompt = `${topic}`
+
+    // Add visual style
+    if (visualStyle) {
+      prompt += `, ${visualStyle} style`
+    }
+
+    // Add brand context for hero image
+    if (index === 0) {
+      prompt += `, hero image for article about ${niche}`
+    } else {
+      prompt += `, illustration for ${niche} article`
+    }
+
+    // Add quality modifiers
+    prompt += ', high quality, professional, clean composition, no text'
+
+    return {
+      heading: topic,
+      prompt: prompt,
+      type: index === 0 ? 'hero' : 'section',
+      aspectRatio: '16:9'
+    }
+  })
 }
 
 /**
@@ -387,11 +488,12 @@ function clearSessionFile() {
 }
 
 /**
- * Reset session state for new workflow
+ * Reset session state for new workflow (clears everything including all articles)
  */
 function resetSession() {
   sessionState.currentWorkflow = null
   sessionState.stepResults = {}
+  sessionState.articles = []  // Clear all saved articles
   sessionState.article = null
   sessionState.title = null
   sessionState.imageUrl = null
@@ -404,6 +506,21 @@ function resetSession() {
 
   // Clear persisted session file when starting fresh
   clearSessionFile()
+}
+
+/**
+ * Clear current working article without removing saved articles
+ * Use this after saving an article to prepare for the next one
+ */
+function clearCurrentArticle() {
+  sessionState.article = null
+  sessionState.title = null
+  sessionState.imageUrl = null
+  sessionState.inlineImages = []
+  sessionState.keywords = null
+  sessionState.metadata = null
+  sessionState.metaTitle = null
+  sessionState.metaDescription = null
 }
 
 /**
@@ -988,7 +1105,7 @@ No parameters needed - I use your project settings automatically!`,
   },
   {
     name: 'publish_content',
-    description: 'Publish saved content to configured CMS platforms. Automatically uses saved article and generated image.',
+    description: 'Publish saved articles to configured CMS platforms. Publishes ALL unpublished articles in the session by default, or specific articles by index.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1007,6 +1124,11 @@ No parameters needed - I use your project settings automatically!`,
         category: {
           type: 'string',
           description: 'WordPress category name - pick the most relevant one from available categories shown in save_content response'
+        },
+        article_numbers: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Optional: Publish specific articles by number (1, 2, 3...). If not specified, publishes ALL unpublished articles.'
         }
       }
     }
@@ -1017,6 +1139,63 @@ No parameters needed - I use your project settings automatically!`,
     inputSchema: {
       type: 'object',
       properties: {}
+    }
+  },
+  {
+    name: 'remove_article',
+    description: 'Remove specific article(s) from the session by number. Does not affect published articles.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        article_numbers: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Article numbers to remove (1, 2, 3...). Use get_session to see article numbers.'
+        }
+      },
+      required: ['article_numbers']
+    }
+  },
+  {
+    name: 'clear_session',
+    description: 'Clear all articles and reset session. Use with caution - this removes all unpublished content!',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        confirm: {
+          type: 'boolean',
+          description: 'Must be true to confirm clearing all content'
+        }
+      },
+      required: ['confirm']
+    }
+  },
+  {
+    name: 'list_content',
+    description: 'List all previously saved content from ~/.suparank/content/. Shows articles that can be loaded back into session for further optimization.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'number',
+          description: 'Max number of articles to show (default: 20)',
+          default: 20
+        }
+      }
+    }
+  },
+  {
+    name: 'load_content',
+    description: 'Load a previously saved article back into the session. Use list_content first to see available articles. Once loaded, you can run optimization tools like quality_check, geo_optimize, internal_links, schema_generate on it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        folder_name: {
+          type: 'string',
+          description: 'Folder name from list_content (e.g., "2026-01-09-my-article-title")'
+        }
+      },
+      required: ['folder_name']
     }
   }
 ]
@@ -1135,6 +1314,10 @@ function buildWorkflowPlan(request, count, publishTo, withImages, project) {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // RESEARCH PHASE
+  // ═══════════════════════════════════════════════════════════
+
   stepNum++
   steps.push({
     step: stepNum,
@@ -1157,7 +1340,97 @@ ${mcpInstructions}
     store: 'keywords'
   })
 
-  // Step 2: Content Planning with SEO Meta
+  // Step 2: SEO Strategy & Content Brief
+  stepNum++
+  steps.push({
+    step: stepNum,
+    type: 'llm_execute',
+    action: 'seo_strategy',
+    instruction: `Create SEO strategy and content brief for: "${request}"
+
+**Using Keywords from Step 1:**
+- Use the primary keyword you identified
+- Incorporate secondary/LSI keywords naturally
+
+**Project Context:**
+- Site: ${siteName}
+- Niche: ${niche}
+- Target audience: ${targetAudience || 'Not specified'}
+- Brand voice: ${brandVoice}
+- Geographic focus: ${geoFocus || 'Global'}
+
+**Deliverables:**
+1. **Search Intent Analysis** - What is the user trying to accomplish?
+2. **Competitor Gap Analysis** - What are top 3 ranking pages missing?
+3. **Content Brief:**
+   - Recommended content type (guide/listicle/how-to/comparison)
+   - Unique angle to differentiate from competitors
+   - Key points to cover that competitors miss
+4. **On-Page SEO Checklist:**
+   - Title tag format
+   - Meta description template
+   - Header structure (H1, H2, H3)
+   - Internal linking opportunities`,
+    store: 'seo_strategy'
+  })
+
+  // Step 3: Topical Map (Content Architecture)
+  stepNum++
+  steps.push({
+    step: stepNum,
+    type: 'llm_execute',
+    action: 'topical_map',
+    instruction: `Design content architecture for: "${request}"
+
+**Build a Pillar-Cluster Structure:**
+- Main pillar topic (this article)
+- Supporting cluster articles (future content opportunities)
+
+**Project Context:**
+- Site: ${siteName}
+- Niche: ${niche}
+- Primary keywords: ${keywordsDisplay}
+
+**Deliverables:**
+1. **Pillar Page Concept** - What should this main article establish?
+2. **Cluster Topics** - 5-7 related subtopics for future articles
+3. **Internal Linking Plan** - How these articles connect
+4. **Content Gaps** - What topics are missing in this niche?
+
+Note: Focus on the CURRENT article structure, but identify opportunities for a content cluster.`,
+    store: 'topical_map'
+  })
+
+  // Step 4: Content Calendar (only for multi-article requests)
+  if (count > 1) {
+    stepNum++
+    steps.push({
+      step: stepNum,
+      type: 'llm_execute',
+      action: 'content_calendar',
+      instruction: `Plan content calendar for ${count} articles about: "${request}"
+
+**Project Context:**
+- Site: ${siteName}
+- Niche: ${niche}
+- Articles to create: ${count}
+
+**Deliverables:**
+1. **Article Sequence** - Order to create articles (foundational → specific)
+2. **Topic List** - ${count} specific titles/topics
+3. **Keyword Assignment** - Primary keyword for each article
+4. **Publishing Cadence** - Recommended frequency
+
+Note: This guides the creation of all ${count} articles in this session.`,
+      store: 'content_calendar'
+    })
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // CREATION PHASE
+  // ═══════════════════════════════════════════════════════════
+
+  // Step N: Content Planning with SEO Meta
   stepNum++
   steps.push({
     step: stepNum,
@@ -1221,7 +1494,93 @@ ${shouldGenerateImages ? '- Image placeholders: [IMAGE: description] where image
     store: 'article'
   })
 
-  // Step 4: Generate Images (if enabled in project settings AND credentials available)
+  // ═══════════════════════════════════════════════════════════
+  // OPTIMIZATION PHASE
+  // ═══════════════════════════════════════════════════════════
+
+  // Quality Check - Pre-publish QA
+  stepNum++
+  steps.push({
+    step: stepNum,
+    type: 'llm_execute',
+    action: 'quality_check',
+    instruction: `Perform quality check on the article you just saved.
+
+**Quality Checklist:**
+
+1. **SEO Check:**
+   - ✓ Primary keyword in H1, first 100 words, URL slug
+   - ✓ Secondary keywords distributed naturally
+   - ✓ Meta title 50-60 characters
+   - ✓ Meta description 150-160 characters
+   - ✓ Proper header hierarchy (H1 → H2 → H3)
+
+2. **Content Quality:**
+   - ✓ Word count meets requirement (${targetWordCount}+ words)
+   - ✓ Reading level appropriate (${readingLevelDisplay})
+   - ✓ No grammar or spelling errors
+   - ✓ Factual accuracy (no made-up statistics)
+
+3. **Brand Consistency:**
+   - ✓ Voice matches: ${brandVoice}
+   - ✓ Speaks to: ${targetAudience || 'target audience'}
+   - ✓ Aligns with ${siteName} brand
+
+4. **Engagement:**
+   - ✓ Strong hook in introduction
+   - ✓ Clear value proposition
+   - ✓ Actionable takeaways
+   - ✓ Compelling CTA in conclusion
+
+**Report any issues found and suggest fixes. If major issues exist, fix them before proceeding.**`,
+    store: 'quality_report'
+  })
+
+  // GEO Optimize - AI Search Engine Optimization
+  stepNum++
+  steps.push({
+    step: stepNum,
+    type: 'llm_execute',
+    action: 'geo_optimize',
+    instruction: `Optimize article for AI search engines (ChatGPT, Perplexity, Google SGE, Claude).
+
+**GEO (Generative Engine Optimization) Checklist:**
+
+1. **Structured Answers:**
+   - ✓ Clear, direct answers to common questions
+   - ✓ Definition boxes for key terms
+   - ✓ TL;DR sections for complex topics
+
+2. **Citation-Worthy Content:**
+   - ✓ Original statistics or data points
+   - ✓ Expert quotes or authoritative sources
+   - ✓ Unique insights not found elsewhere
+
+3. **LLM-Friendly Structure:**
+   - ✓ Bulleted lists for easy extraction
+   - ✓ Tables for comparisons
+   - ✓ Step-by-step numbered processes
+
+4. **Semantic Clarity:**
+   - ✓ Clear topic sentences per paragraph
+   - ✓ Explicit cause-effect relationships
+   - ✓ Avoid ambiguous pronouns
+
+**Target AI Engines:**
+- ChatGPT (conversational answers)
+- Perplexity (citation-heavy)
+- Google SGE (structured snippets)
+- Claude (comprehensive analysis)
+
+**Review the saved article and suggest specific improvements to make it more likely to be cited by AI search engines.**`,
+    store: 'geo_report'
+  })
+
+  // ═══════════════════════════════════════════════════════════
+  // PUBLISHING PHASE
+  // ═══════════════════════════════════════════════════════════
+
+  // Generate Images (if enabled in project settings AND credentials available)
   if (shouldGenerateImages) {
     // Format brand colors for image style guidance
     const colorsDisplay = brandColors.length > 0 ? brandColors.join(', ') : 'Not specified'
@@ -1362,8 +1721,19 @@ async function executeOrchestratorTool(toolName, args, project) {
 | **Include Images** | ${plan.settings.include_images ? 'Yes' : 'No'} |
 | **Images Required** | ${plan.settings.total_images} (1 cover + ${plan.settings.content_images} inline) |
 
-## Workflow Plan
-${plan.steps.map(s => `${s.step}. **${s.action}** ${s.type === 'action' ? '(automatic)' : '(you execute)'}`).join('\n')}
+## Workflow Plan (4 Phases)
+
+### RESEARCH PHASE
+${plan.steps.filter(s => ['keyword_research', 'seo_strategy', 'topical_map', 'content_calendar'].includes(s.action)).map(s => `${s.step}. **${s.action}**`).join('\n')}
+
+### CREATION PHASE
+${plan.steps.filter(s => ['content_planning', 'content_write'].includes(s.action)).map(s => `${s.step}. **${s.action}**`).join('\n')}
+
+### OPTIMIZATION PHASE
+${plan.steps.filter(s => ['quality_check', 'geo_optimize'].includes(s.action)).map(s => `${s.step}. **${s.action}**`).join('\n')}
+
+### PUBLISHING PHASE
+${plan.steps.filter(s => ['generate_images', 'publish'].includes(s.action)).map(s => `${s.step}. **${s.action}**`).join('\n')}
 
 ## Available Integrations (from ~/.suparank/credentials.json)
 - External MCPs: ${mcpList}
@@ -1392,7 +1762,29 @@ ${plan.steps[0].instruction}
 
     case 'save_content': {
       const { title, content, keywords = [], meta_description = '' } = args
+      const wordCount = content.split(/\s+/).length
 
+      // Create article object with unique ID
+      const articleId = generateArticleId()
+      const newArticle = {
+        id: articleId,
+        title,
+        content,
+        keywords,
+        metaDescription: meta_description,
+        metaTitle: title,
+        imageUrl: sessionState.imageUrl || null,  // Attach any generated cover image
+        inlineImages: [...sessionState.inlineImages],  // Copy current inline images
+        savedAt: new Date().toISOString(),
+        published: false,
+        publishedTo: [],
+        wordCount
+      }
+
+      // Add to articles array (not overwriting previous articles!)
+      sessionState.articles.push(newArticle)
+
+      // Also keep in current working fields for backwards compatibility
       sessionState.title = title
       sessionState.article = content
       sessionState.keywords = keywords
@@ -1403,8 +1795,13 @@ ${plan.steps[0].instruction}
       saveSession()
       const contentFolder = saveContentToFolder()
 
-      const wordCount = content.split(/\s+/).length
-      progress('Content', `Saved "${title}" (${wordCount} words)${contentFolder ? ` → ${contentFolder}` : ''}`)
+      progress('Content', `Saved "${title}" (${wordCount} words) as article #${sessionState.articles.length}${contentFolder ? ` → ${contentFolder}` : ''}`)
+
+      // Clear current working images so next article starts fresh
+      // (images are already attached to the saved article)
+      sessionState.imageUrl = null
+      sessionState.inlineImages = []
+
       const workflow = sessionState.currentWorkflow
       const targetWordCount = workflow?.settings?.target_word_count
       const wordCountOk = targetWordCount ? wordCount >= targetWordCount * 0.9 : true // Allow 10% tolerance
@@ -1431,131 +1828,232 @@ When calling \`publish_content\`, include the \`category\` parameter with your c
         }
       }
 
+      // Show all articles in session
+      const articlesListSection = sessionState.articles.length > 1 ? `
+## Articles in Session (${sessionState.articles.length} total)
+${sessionState.articles.map((art, i) => {
+  const status = art.published ? `✅ published to ${art.publishedTo.join(', ')}` : '📝 unpublished'
+  return `${i + 1}. **${art.title}** (${art.wordCount} words) - ${status}`
+}).join('\n')}
+
+Use \`publish_content\` to publish all unpublished articles, or \`get_session\` to see full details.
+` : ''
+
       return {
         content: [{
           type: 'text',
-          text: `# ✅ Content Saved to Session
+          text: `# ✅ Content Saved to Session (Article #${sessionState.articles.length})
 
 **Title:** ${title}
+**Article ID:** ${articleId}
 **Word Count:** ${wordCount} words ${targetWordCount ? (wordCountOk ? '✅' : `⚠️ (target: ${targetWordCount})`) : '(no target set)'}
 **Meta Description:** ${meta_description ? `${meta_description.length} chars ✅` : '❌ Missing!'}
 **Keywords:** ${keywords.join(', ') || 'none specified'}
+**Images:** ${newArticle.imageUrl ? '1 cover' : 'no cover'}${newArticle.inlineImages.length > 0 ? ` + ${newArticle.inlineImages.length} inline` : ''}
 
 ${targetWordCount && !wordCountOk ? `⚠️ **Warning:** Article is ${targetWordCount - wordCount} words short of the ${targetWordCount} word target.\n` : ''}
 ${!meta_description ? '⚠️ **Warning:** Meta description is missing. Add it for better SEO.\n' : ''}
-${categoriesSection}
-## Next Step${includeImages && imageStep ? ': Generate Images' : ': Publish'}
+${articlesListSection}${categoriesSection}
+## Next Step${includeImages && imageStep ? ': Generate Images' : ': Ready to Publish or Continue'}
 ${includeImages && imageStep ? `Generate **${totalImages} images** (1 cover + ${totalImages - 1} inline images).
 
-Call \`generate_image\` ${totalImages} times with prompts based on your article sections.` : 'Proceed to publish with \`publish_content\`.'}`
+Call \`generate_image\` ${totalImages} times with prompts based on your article sections.` : `You can:
+- **Add more articles**: Continue creating content (each save_content adds to the batch)
+- **Publish all**: Call \`publish_content\` to publish all ${sessionState.articles.length} article(s)
+- **View session**: Call \`get_session\` to see all saved articles`}`
         }]
       }
     }
 
     case 'publish_content': {
-      const { platforms = ['all'], status = 'draft', category = '' } = args
+      const { platforms = ['all'], status = 'draft', category = '', article_numbers = [] } = args
 
-      if (!sessionState.article || !sessionState.title) {
+      // Determine which articles to publish
+      let articlesToPublish = []
+
+      if (article_numbers && article_numbers.length > 0) {
+        // Publish specific articles by number (1-indexed)
+        articlesToPublish = article_numbers
+          .map(num => sessionState.articles[num - 1])
+          .filter(art => art && !art.published)
+
+        if (articlesToPublish.length === 0) {
+          return {
+            content: [{
+              type: 'text',
+              text: `❌ No valid unpublished articles found for numbers: ${article_numbers.join(', ')}
+
+Use \`get_session\` to see available articles and their numbers.`
+            }]
+          }
+        }
+      } else {
+        // Publish all unpublished articles
+        articlesToPublish = sessionState.articles.filter(art => !art.published)
+      }
+
+      // Fallback: Check if there's a current working article not yet saved
+      if (articlesToPublish.length === 0 && sessionState.article && sessionState.title) {
+        // Create temporary article from current working state for backwards compatibility
+        articlesToPublish = [{
+          id: 'current',
+          title: sessionState.title,
+          content: sessionState.article,
+          keywords: sessionState.keywords || [],
+          metaDescription: sessionState.metaDescription || '',
+          imageUrl: sessionState.imageUrl,
+          inlineImages: sessionState.inlineImages
+        }]
+      }
+
+      if (articlesToPublish.length === 0) {
         return {
           content: [{
             type: 'text',
-            text: '❌ No content saved. Please use save_content first to save your article.'
+            text: `❌ No unpublished articles found in session.
+
+Use \`save_content\` after writing an article, then call \`publish_content\`.
+Or use \`get_session\` to see current session state.`
           }]
         }
       }
 
-      // Inject inline images into content (replace [IMAGE: ...] placeholders)
-      let contentWithImages = sessionState.article
-      let imageIndex = 0
-      contentWithImages = contentWithImages.replace(/\[IMAGE:\s*([^\]]+)\]/gi, (match, description) => {
-        if (imageIndex < sessionState.inlineImages.length) {
-          const imgUrl = sessionState.inlineImages[imageIndex]
-          imageIndex++
-          return `![${description.trim()}](${imgUrl})`
-        }
-        return match // Keep placeholder if no image available
-      })
-
-      const results = []
       const hasGhost = hasCredential('ghost')
       const hasWordPress = hasCredential('wordpress')
-
       const shouldPublishGhost = hasGhost && (platforms.includes('all') || platforms.includes('ghost'))
       const shouldPublishWordPress = hasWordPress && (platforms.includes('all') || platforms.includes('wordpress'))
 
-      // Publish to Ghost
-      if (shouldPublishGhost) {
-        try {
-          const ghostResult = await executeGhostPublish({
-            title: sessionState.title,
-            content: contentWithImages,
-            status: status,
-            tags: sessionState.keywords || [],
-            featured_image_url: sessionState.imageUrl
-          })
-          results.push({ platform: 'Ghost', success: true, result: ghostResult })
-        } catch (e) {
-          results.push({ platform: 'Ghost', success: false, error: e.message })
+      // Results for all articles
+      const allResults = []
+
+      progress('Publishing', `Starting batch publish of ${articlesToPublish.length} article(s)`)
+
+      // Publish each article
+      for (let i = 0; i < articlesToPublish.length; i++) {
+        const article = articlesToPublish[i]
+        progress('Publishing', `Article ${i + 1}/${articlesToPublish.length}: "${article.title}"`)
+
+        // Inject inline images into content (replace [IMAGE: ...] placeholders)
+        let contentWithImages = article.content
+        let imageIndex = 0
+        const articleInlineImages = article.inlineImages || []
+        contentWithImages = contentWithImages.replace(/\[IMAGE:\s*([^\]]+)\]/gi, (match, description) => {
+          if (imageIndex < articleInlineImages.length) {
+            const imgUrl = articleInlineImages[imageIndex]
+            imageIndex++
+            return `![${description.trim()}](${imgUrl})`
+          }
+          return match // Keep placeholder if no image available
+        })
+
+        const articleResults = {
+          article: article.title,
+          articleId: article.id,
+          wordCount: article.wordCount || contentWithImages.split(/\s+/).length,
+          platforms: []
         }
+
+        // Publish to Ghost
+        if (shouldPublishGhost) {
+          try {
+            const ghostResult = await executeGhostPublish({
+              title: article.title,
+              content: contentWithImages,
+              status: status,
+              tags: article.keywords || [],
+              featured_image_url: article.imageUrl
+            })
+            articleResults.platforms.push({ platform: 'Ghost', success: true, result: ghostResult })
+          } catch (e) {
+            articleResults.platforms.push({ platform: 'Ghost', success: false, error: e.message })
+          }
+        }
+
+        // Publish to WordPress
+        if (shouldPublishWordPress) {
+          try {
+            const categories = category ? [category] : []
+            const wpResult = await executeWordPressPublish({
+              title: article.title,
+              content: contentWithImages,
+              status: status,
+              categories: categories,
+              tags: article.keywords || [],
+              featured_image_url: article.imageUrl
+            })
+            articleResults.platforms.push({ platform: 'WordPress', success: true, result: wpResult })
+          } catch (e) {
+            articleResults.platforms.push({ platform: 'WordPress', success: false, error: e.message })
+          }
+        }
+
+        // Mark article as published if at least one platform succeeded
+        const hasSuccess = articleResults.platforms.some(p => p.success)
+        if (hasSuccess && article.id !== 'current') {
+          const articleIndex = sessionState.articles.findIndex(a => a.id === article.id)
+          if (articleIndex !== -1) {
+            sessionState.articles[articleIndex].published = true
+            sessionState.articles[articleIndex].publishedTo = articleResults.platforms
+              .filter(p => p.success)
+              .map(p => p.platform.toLowerCase())
+            sessionState.articles[articleIndex].publishedAt = new Date().toISOString()
+          }
+        }
+
+        allResults.push(articleResults)
       }
 
-      // Publish to WordPress with intelligent category assignment
-      if (shouldPublishWordPress) {
-        try {
-          // Use selected category or empty array
-          const categories = category ? [category] : []
-          log(`Publishing to WordPress with category: ${category || '(none selected)'}`)
+      // Save updated session state (with published flags)
+      saveSession()
 
-          const wpResult = await executeWordPressPublish({
-            title: sessionState.title,
-            content: contentWithImages,
-            status: status,
-            categories: categories,
-            tags: sessionState.keywords || [],
-            featured_image_url: sessionState.imageUrl
-          })
-          results.push({ platform: 'WordPress', success: true, result: wpResult, category: category || null })
-        } catch (e) {
-          results.push({ platform: 'WordPress', success: false, error: e.message })
-        }
-      }
+      // Build response
+      const totalArticles = allResults.length
+      const successfulArticles = allResults.filter(r => r.platforms.some(p => p.success)).length
+      const totalWords = allResults.reduce((sum, r) => sum + r.wordCount, 0)
 
-      // Format response
-      const wordCount = contentWithImages.split(/\s+/).length
-      const inlineImagesUsed = imageIndex
+      let response = `# 📤 Batch Publishing Results
 
-      let response = `# 📤 Publishing Results
+## Summary
+- **Articles Published:** ${successfulArticles}/${totalArticles}
+- **Total Words:** ${totalWords.toLocaleString()}
+- **Status:** ${status}
+- **Platforms:** ${[shouldPublishGhost ? 'Ghost' : null, shouldPublishWordPress ? 'WordPress' : null].filter(Boolean).join(', ') || 'None'}
+${category ? `- **Category:** ${category}` : ''}
 
-## Content Summary
-- **Title:** ${sessionState.title}
-- **Word Count:** ${wordCount} words
-- **Meta Description:** ${sessionState.metaDescription ? '✅ Included' : '❌ Missing'}
-- **Cover Image:** ${sessionState.imageUrl ? '✅ Set' : '❌ Missing'}
-- **Inline Images:** ${inlineImagesUsed} injected into content
-- **Keywords/Tags:** ${sessionState.keywords?.join(', ') || 'None'}
-- **Category:** ${category || 'Not specified'}
+---
 
 `
 
-      for (const r of results) {
-        if (r.success) {
-          response += `## ✅ ${r.platform}\n${r.result.content[0].text}\n\n`
-        } else {
-          response += `## ❌ ${r.platform}\nError: ${r.error}\n\n`
+      // Detail for each article
+      for (const result of allResults) {
+        const hasAnySuccess = result.platforms.some(p => p.success)
+        response += `## ${hasAnySuccess ? '✅' : '❌'} ${result.article}\n`
+        response += `**Words:** ${result.wordCount}\n\n`
+
+        for (const p of result.platforms) {
+          if (p.success) {
+            response += `**${p.platform}:** ✅ Published\n`
+            // Extract URL if available
+            const resultText = p.result?.content?.[0]?.text || ''
+            const urlMatch = resultText.match(/https?:\/\/[^\s\)]+/)
+            if (urlMatch) {
+              response += `URL: ${urlMatch[0]}\n`
+            }
+          } else {
+            response += `**${p.platform}:** ❌ ${p.error}\n`
+          }
         }
+        response += '\n'
       }
 
-      if (results.length === 0) {
-        response += `No platforms configured or selected for publishing.\n`
-        response += `Available: Ghost (${hasGhost ? 'yes' : 'no'}), WordPress (${hasWordPress ? 'yes' : 'no'})`
-      }
-
-      // Clear session after successful publish (at least one success)
-      const hasSuccessfulPublish = results.some(r => r.success)
-      if (hasSuccessfulPublish) {
-        clearSessionFile()
-        resetSession()
-        response += '\n---\n✅ Session cleared. Ready for new content.'
+      // Show remaining unpublished articles
+      const remainingUnpublished = sessionState.articles.filter(a => !a.published)
+      if (remainingUnpublished.length > 0) {
+        response += `---\n\n**📝 ${remainingUnpublished.length} article(s) still unpublished** in session.\n`
+        response += `Call \`publish_content\` again to publish remaining, or \`get_session\` to see details.\n`
+      } else if (sessionState.articles.length > 0) {
+        response += `---\n\n✅ **All ${sessionState.articles.length} articles published!**\n`
+        response += `Session retained for reference. Start a new workflow to clear.\n`
       }
 
       return {
@@ -1571,34 +2069,394 @@ Call \`generate_image\` ${totalImages} times with prompts based on your article 
       const imagesGenerated = (sessionState.imageUrl ? 1 : 0) + sessionState.inlineImages.length
       const workflow = sessionState.currentWorkflow
 
+      // Count totals across all articles
+      const totalArticles = sessionState.articles.length
+      const unpublishedArticles = sessionState.articles.filter(a => !a.published)
+      const publishedArticles = sessionState.articles.filter(a => a.published)
+      const totalWords = sessionState.articles.reduce((sum, a) => sum + (a.wordCount || 0), 0)
+      const totalImages = sessionState.articles.reduce((sum, a) => {
+        return sum + (a.imageUrl ? 1 : 0) + (a.inlineImages?.length || 0)
+      }, 0)
+
+      // Build articles list
+      const articlesSection = sessionState.articles.length > 0 ? `
+## 📚 Saved Articles (${totalArticles} total)
+
+| # | Title | Words | Images | Status |
+|---|-------|-------|--------|--------|
+${sessionState.articles.map((art, i) => {
+  const imgCount = (art.imageUrl ? 1 : 0) + (art.inlineImages?.length || 0)
+  const status = art.published ? `✅ ${art.publishedTo.join(', ')}` : '📝 Unpublished'
+  return `| ${i + 1} | ${art.title.substring(0, 40)}${art.title.length > 40 ? '...' : ''} | ${art.wordCount} | ${imgCount} | ${status} |`
+}).join('\n')}
+
+**Summary:** ${totalWords.toLocaleString()} total words, ${totalImages} total images
+**Unpublished:** ${unpublishedArticles.length} article(s) ready to publish
+` : `
+## 📚 Saved Articles
+No articles saved yet. Use \`save_content\` after writing an article.
+`
+
+      // Current working article (if any in progress)
+      const currentWorkingSection = sessionState.title && sessionState.article ? `
+## 🖊️ Current Working Article
+**Title:** ${sessionState.title}
+**Word Count:** ${sessionState.article.split(/\s+/).length} words
+**Meta Description:** ${sessionState.metaDescription || 'Not set'}
+**Cover Image:** ${sessionState.imageUrl ? '✅ Generated' : '❌ Not yet'}
+**Inline Images:** ${sessionState.inlineImages.length}
+
+*This article is being edited. Call \`save_content\` to add it to the session.*
+` : ''
+
       return {
         content: [{
           type: 'text',
-          text: `# 📋 Current Session State
+          text: `# 📋 Session State
 
 **Workflow:** ${workflow?.workflow_id || 'None active'}
-
-## Content
-**Title:** ${sessionState.title || 'Not set'}
-**Article:** ${sessionState.article ? `${sessionState.article.split(/\s+/).length} words` : 'Not saved'}
-**Meta Description:** ${sessionState.metaDescription || 'Not set'}
-**Keywords:** ${sessionState.keywords?.join(', ') || 'None'}
-
-## Images (${imagesGenerated}/${totalImagesNeeded})
+**Total Articles:** ${totalArticles}
+**Ready to Publish:** ${unpublishedArticles.length}
+**Already Published:** ${publishedArticles.length}
+${articlesSection}${currentWorkingSection}
+## 🖼️ Current Working Images (${imagesGenerated}/${totalImagesNeeded})
 **Cover Image:** ${sessionState.imageUrl || 'Not generated'}
-**Inline Images:** ${sessionState.inlineImages.length > 0 ? sessionState.inlineImages.map((url, i) => `\n  ${i+1}. ${url}`).join('') : 'None'}
+**Inline Images:** ${sessionState.inlineImages.length > 0 ? sessionState.inlineImages.map((url, i) => `\n  ${i+1}. ${url.substring(0, 60)}...`).join('') : 'None'}
 
 ${workflow ? `
-## Project Settings (from database)
+## ⚙️ Project Settings
 - **Project:** ${workflow.project_info?.name || 'Unknown'}
 - **Niche:** ${workflow.project_info?.niche || 'Unknown'}
 - **Word Count Target:** ${workflow.settings?.target_word_count || 'Not set'}
 - **Reading Level:** ${workflow.settings?.reading_level_display || 'Not set'}
 - **Brand Voice:** ${workflow.settings?.brand_voice || 'Not set'}
-- **Visual Style:** ${workflow.settings?.visual_style || 'Not set'}
 - **Include Images:** ${workflow.settings?.include_images ? 'Yes' : 'No'}
-- **Total Images:** ${totalImagesNeeded}
-` : ''}`
+` : ''}
+## 🚀 Actions
+- **Publish all unpublished:** Call \`publish_content\`
+- **Add more articles:** Use \`create_content\` or \`content_write\` then \`save_content\`
+- **Remove articles:** Call \`remove_article\` with article numbers
+- **Clear session:** Call \`clear_session\` with confirm: true`
+        }]
+      }
+    }
+
+    case 'remove_article': {
+      const { article_numbers } = args
+
+      if (!article_numbers || article_numbers.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Please specify article numbers to remove. Use \`get_session\` to see article numbers.`
+          }]
+        }
+      }
+
+      // Sort in descending order to avoid index shifting issues
+      const sortedNumbers = [...article_numbers].sort((a, b) => b - a)
+      const removed = []
+      const skipped = []
+
+      for (const num of sortedNumbers) {
+        const index = num - 1
+        if (index < 0 || index >= sessionState.articles.length) {
+          skipped.push({ num, reason: 'not found' })
+          continue
+        }
+
+        const article = sessionState.articles[index]
+        if (article.published) {
+          skipped.push({ num, reason: 'already published', title: article.title })
+          continue
+        }
+
+        // Remove the article
+        const [removedArticle] = sessionState.articles.splice(index, 1)
+        removed.push({ num, title: removedArticle.title })
+      }
+
+      // Save session
+      saveSession()
+
+      let response = `# 🗑️ Article Removal Results\n\n`
+
+      if (removed.length > 0) {
+        response += `## ✅ Removed (${removed.length})\n`
+        for (const r of removed) {
+          response += `- #${r.num}: "${r.title}"\n`
+        }
+        response += '\n'
+      }
+
+      if (skipped.length > 0) {
+        response += `## ⚠️ Skipped (${skipped.length})\n`
+        for (const s of skipped) {
+          if (s.reason === 'already published') {
+            response += `- #${s.num}: "${s.title}" (already published - cannot remove)\n`
+          } else {
+            response += `- #${s.num}: not found\n`
+          }
+        }
+        response += '\n'
+      }
+
+      response += `---\n\n**${sessionState.articles.length} article(s) remaining in session.**`
+
+      return {
+        content: [{
+          type: 'text',
+          text: response
+        }]
+      }
+    }
+
+    case 'clear_session': {
+      const { confirm } = args
+
+      if (!confirm) {
+        return {
+          content: [{
+            type: 'text',
+            text: `⚠️ **Clear Session requires confirmation**
+
+This will permanently remove:
+- ${sessionState.articles.length} saved article(s)
+- All generated images
+- Current workflow state
+
+To confirm, call \`clear_session\` with \`confirm: true\``
+          }]
+        }
+      }
+
+      const articleCount = sessionState.articles.length
+      const unpublishedCount = sessionState.articles.filter(a => !a.published).length
+
+      // Clear everything
+      resetSession()
+
+      return {
+        content: [{
+          type: 'text',
+          text: `# ✅ Session Cleared
+
+Removed:
+- ${articleCount} article(s) (${unpublishedCount} unpublished)
+- All workflow state
+- All generated images
+
+Session is now empty. Ready for new content creation.`
+        }]
+      }
+    }
+
+    case 'list_content': {
+      const { limit = 20 } = args
+      const contentDir = getContentDir()
+
+      if (!fs.existsSync(contentDir)) {
+        return {
+          content: [{
+            type: 'text',
+            text: `# 📂 Saved Content
+
+No content directory found at \`${contentDir}\`.
+
+Save articles using \`save_content\` and they will appear here.`
+          }]
+        }
+      }
+
+      // Get all content folders
+      const folders = fs.readdirSync(contentDir, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory())
+        .map(dirent => {
+          const folderPath = path.join(contentDir, dirent.name)
+          const metadataPath = path.join(folderPath, 'metadata.json')
+
+          let metadata = null
+          if (fs.existsSync(metadataPath)) {
+            try {
+              metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf-8'))
+            } catch (e) {
+              // Ignore parse errors
+            }
+          }
+
+          return {
+            name: dirent.name,
+            path: folderPath,
+            metadata,
+            mtime: fs.statSync(folderPath).mtime
+          }
+        })
+        .sort((a, b) => b.mtime - a.mtime) // Most recent first
+        .slice(0, limit)
+
+      if (folders.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: `# 📂 Saved Content
+
+No saved articles found in \`${contentDir}\`.
+
+Save articles using \`save_content\` and they will appear here.`
+          }]
+        }
+      }
+
+      let response = `# 📂 Saved Content (${folders.length} articles)
+
+| # | Date | Title | Words | Project |
+|---|------|-------|-------|---------|
+`
+      folders.forEach((folder, i) => {
+        const date = folder.name.split('-').slice(0, 3).join('-')
+        const title = folder.metadata?.title || folder.name.split('-').slice(3).join('-')
+        const words = folder.metadata?.wordCount || '?'
+        const project = folder.metadata?.projectSlug || '-'
+        response += `| ${i + 1} | ${date} | ${title.substring(0, 35)}${title.length > 35 ? '...' : ''} | ${words} | ${project} |\n`
+      })
+
+      response += `
+---
+
+## To Load an Article
+
+Call \`load_content\` with the folder name:
+\`\`\`
+load_content({ folder_name: "${folders[0]?.name}" })
+\`\`\`
+
+Once loaded, you can run optimization tools:
+- \`quality_check\` - Pre-publish quality assurance
+- \`geo_optimize\` - AI search engine optimization
+- \`internal_links\` - Internal linking suggestions
+- \`schema_generate\` - JSON-LD structured data
+- \`save_content\` - Re-save with changes
+- \`publish_content\` - Publish to CMS`
+
+      return {
+        content: [{
+          type: 'text',
+          text: response
+        }]
+      }
+    }
+
+    case 'load_content': {
+      const { folder_name } = args
+
+      if (!folder_name) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Please specify a folder_name. Use \`list_content\` to see available articles.`
+          }]
+        }
+      }
+
+      const contentDir = getContentDir()
+      const folderPath = path.join(contentDir, folder_name)
+
+      if (!fs.existsSync(folderPath)) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Folder not found: \`${folder_name}\`
+
+Use \`list_content\` to see available articles.`
+          }]
+        }
+      }
+
+      // Load article and metadata
+      const articlePath = path.join(folderPath, 'article.md')
+      const metadataPath = path.join(folderPath, 'metadata.json')
+
+      if (!fs.existsSync(articlePath)) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ No article.md found in \`${folder_name}\``
+          }]
+        }
+      }
+
+      const articleContent = fs.readFileSync(articlePath, 'utf-8')
+      let metadata = {}
+      if (fs.existsSync(metadataPath)) {
+        try {
+          metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf-8'))
+        } catch (e) {
+          log(`Warning: Failed to parse metadata.json: ${e.message}`)
+        }
+      }
+
+      // Load into session state
+      sessionState.title = metadata.title || folder_name
+      sessionState.article = articleContent
+      sessionState.keywords = metadata.keywords || []
+      sessionState.metaDescription = metadata.metaDescription || ''
+      sessionState.metaTitle = metadata.metaTitle || metadata.title || folder_name
+      sessionState.imageUrl = metadata.imageUrl || null
+      sessionState.inlineImages = metadata.inlineImages || []
+      sessionState.contentFolder = folderPath
+
+      // Also add to articles array if not already there
+      const existingIndex = sessionState.articles.findIndex(a => a.title === sessionState.title)
+      if (existingIndex === -1) {
+        const loadedArticle = {
+          id: generateArticleId(),
+          title: sessionState.title,
+          content: articleContent,
+          keywords: sessionState.keywords,
+          metaDescription: sessionState.metaDescription,
+          metaTitle: sessionState.metaTitle,
+          imageUrl: sessionState.imageUrl,
+          inlineImages: sessionState.inlineImages,
+          savedAt: metadata.createdAt || new Date().toISOString(),
+          published: false,
+          publishedTo: [],
+          wordCount: articleContent.split(/\s+/).length,
+          loadedFrom: folderPath
+        }
+        sessionState.articles.push(loadedArticle)
+      }
+
+      // Save session
+      saveSession()
+
+      const wordCount = articleContent.split(/\s+/).length
+      progress('Content', `Loaded "${sessionState.title}" (${wordCount} words) from ${folder_name}`)
+
+      return {
+        content: [{
+          type: 'text',
+          text: `# ✅ Content Loaded
+
+**Title:** ${sessionState.title}
+**Word Count:** ${wordCount}
+**Keywords:** ${sessionState.keywords.join(', ') || 'None'}
+**Meta Description:** ${sessionState.metaDescription ? `${sessionState.metaDescription.length} chars` : 'None'}
+**Cover Image:** ${sessionState.imageUrl ? '✅' : '❌'}
+**Inline Images:** ${sessionState.inlineImages.length}
+**Source:** \`${folderPath}\`
+
+---
+
+## Now you can run optimization tools:
+
+- **\`quality_check\`** - Pre-publish quality assurance
+- **\`geo_optimize\`** - Optimize for AI search engines (ChatGPT, Perplexity)
+- **\`internal_links\`** - Get internal linking suggestions
+- **\`schema_generate\`** - Generate JSON-LD structured data
+- **\`save_content\`** - Re-save after making changes
+- **\`publish_content\`** - Publish to WordPress/Ghost
+
+Article is now in session (#${sessionState.articles.length}) and ready for further processing.`
         }]
       }
     }
@@ -2238,12 +3096,78 @@ async function executeSendWebhook(args) {
 }
 
 /**
+ * Essential tools shown in the tool list (5 tools for "stupid simple" UX)
+ * Other tools still work when called directly by LLM, but aren't shown in list
+ */
+const VISIBLE_TOOLS = [
+  'create_content',     // Main entry point - creates & publishes automatically
+  'keyword_research',   // Research keywords separately (on-demand)
+  'generate_image',     // Generate/regenerate images (on-demand)
+  'publish_content',    // Manual publish trigger (on-demand)
+  'get_session'         // Check status (on-demand)
+]
+
+/**
  * Get all available tools based on configured credentials
+ * Only shows essential tools to users (5 tools instead of 24)
+ * Hidden tools still work when LLM calls them directly
  */
 function getAvailableTools() {
+  const tools = []
+
+  // Add visible TOOLS (keyword_research only from main tools)
+  for (const tool of TOOLS) {
+    if (VISIBLE_TOOLS.includes(tool.name)) {
+      tools.push({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema
+      })
+    }
+  }
+
+  // Add visible orchestrator tools
+  for (const tool of ORCHESTRATOR_TOOLS) {
+    if (VISIBLE_TOOLS.includes(tool.name)) {
+      tools.push({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema
+      })
+    }
+  }
+
+  // Add visible action tools (only if credentials are configured)
+  for (const tool of ACTION_TOOLS) {
+    if (VISIBLE_TOOLS.includes(tool.name)) {
+      if (hasCredential(tool.requiresCredential)) {
+        tools.push({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema
+        })
+      } else {
+        // Add disabled version with note
+        tools.push({
+          name: tool.name,
+          description: `[DISABLED - requires ${tool.requiresCredential} credentials] ${tool.description}`,
+          inputSchema: tool.inputSchema
+        })
+      }
+    }
+  }
+
+  return tools
+}
+
+/**
+ * Get ALL tools (visible + hidden) for tool execution
+ * This is used by CallToolRequestSchema to find tools by name
+ */
+function getAllTools() {
   const tools = [...TOOLS]
 
-  // Add orchestrator tools (always available)
+  // Add all orchestrator tools
   for (const tool of ORCHESTRATOR_TOOLS) {
     tools.push({
       name: tool.name,
@@ -2252,22 +3176,14 @@ function getAvailableTools() {
     })
   }
 
-  // Add action tools only if credentials are configured
+  // Add all action tools
   for (const tool of ACTION_TOOLS) {
-    if (hasCredential(tool.requiresCredential)) {
-      tools.push({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema
-      })
-    } else {
-      // Add disabled version with note
-      tools.push({
-        name: tool.name,
-        description: `[DISABLED - requires ${tool.requiresCredential} credentials] ${tool.description}`,
-        inputSchema: tool.inputSchema
-      })
-    }
+    tools.push({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      requiresCredential: tool.requiresCredential
+    })
   }
 
   return tools
