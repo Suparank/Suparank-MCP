@@ -35,6 +35,17 @@ const projectSlug = process.argv[2]
 const apiKey = process.argv[3]
 const apiUrl = process.env.SUPARANK_API_URL || 'https://api.suparank.io'
 
+// ============================================================================
+// EXTERNAL API ENDPOINTS - Configurable via environment variables
+// ============================================================================
+const API_ENDPOINTS = {
+  // Image generation providers
+  fal: process.env.FAL_API_URL || 'https://fal.run/fal-ai/nano-banana-pro',
+  gemini: process.env.GEMINI_API_URL || 'https://generativelanguage.googleapis.com/v1beta/models',
+  wiro: process.env.WIRO_API_URL || 'https://api.wiro.ai/v1',
+  wiroTaskDetail: process.env.WIRO_TASK_URL || 'https://api.wiro.ai/v1/Task/Detail'
+}
+
 if (!projectSlug) {
   console.error('Error: Project slug is required')
   console.error('Usage: node mcp-client.js <project-slug> <api-key>')
@@ -145,6 +156,49 @@ function ensureContentDir() {
 }
 
 /**
+ * Get the path to the stats file (~/.suparank/stats.json)
+ */
+function getStatsFile() {
+  return path.join(getSuparankDir(), 'stats.json')
+}
+
+/**
+ * Load usage stats
+ */
+function loadStats() {
+  try {
+    const file = getStatsFile()
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf-8'))
+    }
+  } catch (e) {
+    log(`Warning: Could not load stats: ${e.message}`)
+  }
+  return { tool_calls: 0, images_generated: 0, articles_created: 0, words_written: 0 }
+}
+
+/**
+ * Save usage stats
+ */
+function saveStats(stats) {
+  try {
+    ensureSuparankDir()
+    fs.writeFileSync(getStatsFile(), JSON.stringify(stats, null, 2))
+  } catch (e) {
+    log(`Error saving stats: ${e.message}`)
+  }
+}
+
+/**
+ * Increment a stat counter
+ */
+function incrementStat(key, amount = 1) {
+  const stats = loadStats()
+  stats[key] = (stats[key] || 0) + amount
+  saveStats(stats)
+}
+
+/**
  * Generate a slug from title for folder naming
  */
 function slugify(text) {
@@ -153,6 +207,46 @@ function slugify(text) {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '')
     .substring(0, 50)
+}
+
+// ============================================================================
+// PATH SANITIZATION - Prevents path traversal attacks
+// ============================================================================
+
+/**
+ * Sanitize and validate a path to prevent traversal attacks
+ * @param {string} userPath - User-provided path segment
+ * @param {string} allowedBase - Base directory that paths must stay within
+ * @returns {string} - Resolved safe path
+ * @throws {Error} - If path would escape the allowed base
+ */
+function sanitizePath(userPath, allowedBase) {
+  // Remove any null bytes (common attack vector)
+  const cleanPath = userPath.replace(/\0/g, '')
+
+  // Resolve to absolute path
+  const resolved = path.resolve(allowedBase, cleanPath)
+
+  // Ensure the resolved path starts with the allowed base
+  // Adding path.sep ensures we don't match partial directory names
+  const normalizedBase = path.normalize(allowedBase + path.sep)
+  const normalizedResolved = path.normalize(resolved + path.sep)
+
+  if (!normalizedResolved.startsWith(normalizedBase)) {
+    throw new Error(`Path traversal detected: "${userPath}" would escape allowed directory`)
+  }
+
+  return resolved
+}
+
+/**
+ * Get content folder path safely
+ * @param {string} folderName - Folder name (article ID or title slug)
+ * @returns {string} - Safe path to content folder
+ */
+function getContentFolderSafe(folderName) {
+  const contentDir = path.join(getSuparankDir(), 'content')
+  return sanitizePath(folderName, contentDir)
 }
 
 /**
@@ -315,9 +409,56 @@ function loadSession() {
   return false
 }
 
+// ============================================================================
+// SESSION MUTEX - Prevents race conditions on concurrent session writes
+// ============================================================================
+
+let sessionLock = false
+const sessionLockQueue = []
+
+/**
+ * Acquire session lock for safe concurrent access
+ * @returns {Promise<void>}
+ */
+async function acquireSessionLock() {
+  if (!sessionLock) {
+    sessionLock = true
+    return
+  }
+  return new Promise(resolve => {
+    sessionLockQueue.push(resolve)
+  })
+}
+
+/**
+ * Release session lock, allowing next queued operation
+ */
+function releaseSessionLock() {
+  if (sessionLockQueue.length > 0) {
+    const next = sessionLockQueue.shift()
+    next()
+  } else {
+    sessionLock = false
+  }
+}
+
+/**
+ * Safe session save with mutex - use this for concurrent operations
+ * @returns {Promise<void>}
+ */
+async function saveSessionSafe() {
+  await acquireSessionLock()
+  try {
+    saveSession()
+  } finally {
+    releaseSessionLock()
+  }
+}
+
 /**
  * Save session state to file (persists across MCP restarts)
  * Uses atomic write to prevent corruption
+ * NOTE: For concurrent operations, use saveSessionSafe() instead
  */
 function saveSession() {
   try {
@@ -416,11 +557,13 @@ function saveContentToFolder() {
   try {
     ensureContentDir()
 
-    // Create folder name: YYYY-MM-DD-slug
+    // Create folder name: YYYY-MM-DD-slug (slugify removes dangerous characters)
     const date = new Date().toISOString().split('T')[0]
     const slug = slugify(sessionState.title)
     const folderName = `${date}-${slug}`
-    const folderPath = path.join(getContentDir(), folderName)
+
+    // Use safe path function to prevent any path traversal
+    const folderPath = getContentFolderSafe(folderName)
 
     // Create folder if doesn't exist
     if (!fs.existsSync(folderPath)) {
@@ -1922,6 +2065,10 @@ ${plan.steps[0].instruction}
       // Add to articles array (not overwriting previous articles!)
       sessionState.articles.push(newArticle)
 
+      // Track stats
+      incrementStat('articles_created')
+      incrementStat('words_written', wordCount)
+
       // Also keep in current working fields for backwards compatibility
       sessionState.title = title
       sessionState.article = content
@@ -2513,8 +2660,18 @@ Once loaded, you can run optimization tools:
         }
       }
 
-      const contentDir = getContentDir()
-      const folderPath = path.join(contentDir, folder_name)
+      // Sanitize folder_name to prevent path traversal attacks
+      let folderPath
+      try {
+        folderPath = getContentFolderSafe(folder_name)
+      } catch (error) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Invalid folder name: ${error.message}`
+          }]
+        }
+      }
 
       if (!fs.existsSync(folderPath)) {
         return {
@@ -2660,7 +2817,7 @@ async function executeImageGeneration(args) {
   switch (provider) {
     case 'fal': {
       // fal.ai Nano Banana Pro (gemini-3-pro-image)
-      const response = await fetchWithRetry('https://fal.run/fal-ai/nano-banana-pro', {
+      const response = await fetchWithRetry(API_ENDPOINTS.fal, {
         method: 'POST',
         headers: {
           'Authorization': `Key ${config.api_key}`,
@@ -2694,6 +2851,9 @@ async function executeImageGeneration(args) {
       // Persist session to file
       saveSession()
 
+      // Track stats
+      incrementStat('images_generated')
+
       const imageNumber = 1 + sessionState.inlineImages.length
       const totalImages = sessionState.currentWorkflow?.settings?.total_images || 1
       const imageType = imageNumber === 1 ? 'Cover Image' : `Inline Image ${imageNumber - 1}`
@@ -2718,7 +2878,7 @@ ${imageNumber < totalImages ? `\n**Next:** Generate ${totalImages - imageNumber}
       // Google Gemini 3 Pro Image (Nano Banana Pro) - generateContent API
       const model = config.model || 'gemini-3-pro-image-preview'
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        `${API_ENDPOINTS.gemini}/${model}:generateContent`,
         {
           method: 'POST',
           headers: {
@@ -2757,6 +2917,9 @@ ${imageNumber < totalImages ? `\n**Next:** Generate ${totalImages - imageNumber}
       // Return base64 data URI
       const dataUri = `data:${mimeType};base64,${imageData}`
 
+      // Track stats
+      incrementStat('images_generated')
+
       return {
         content: [{
           type: 'text',
@@ -2786,7 +2949,7 @@ ${imageNumber < totalImages ? `\n**Next:** Generate ${totalImages - imageNumber}
 
       // Submit task
       log(`Submitting wiro.ai task for model: ${model}`)
-      const submitResponse = await fetch(`https://api.wiro.ai/v1/Run/${model}`, {
+      const submitResponse = await fetch(`${API_ENDPOINTS.wiro}/Run/${model}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2829,7 +2992,7 @@ ${imageNumber < totalImages ? `\n**Next:** Generate ${totalImages - imageNumber}
           .update(pollSignatureData)
           .digest('hex')
 
-        const pollResponse = await fetch('https://api.wiro.ai/v1/Task/Detail', {
+        const pollResponse = await fetch(API_ENDPOINTS.wiroTaskDetail, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -2870,6 +3033,9 @@ ${imageNumber < totalImages ? `\n**Next:** Generate ${totalImages - imageNumber}
 
           // Persist session to file
           saveSession()
+
+          // Track stats
+          incrementStat('images_generated')
 
           const imageNumber = 1 + sessionState.inlineImages.length
           const totalImages = sessionState.currentWorkflow?.settings?.total_images || 1
@@ -3429,6 +3595,9 @@ async function main() {
     const { name, arguments: args } = request.params
     progress('Tool', `Executing ${name}`)
     log(`Executing tool: ${name}`)
+
+    // Track tool call stats
+    incrementStat('tool_calls')
 
     // Check if this is an orchestrator tool
     const orchestratorTool = ORCHESTRATOR_TOOLS.find(t => t.name === name)

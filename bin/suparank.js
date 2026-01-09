@@ -23,6 +23,8 @@ const SUPARANK_DIR = path.join(os.homedir(), '.suparank')
 const CONFIG_FILE = path.join(SUPARANK_DIR, 'config.json')
 const CREDENTIALS_FILE = path.join(SUPARANK_DIR, 'credentials.json')
 const SESSION_FILE = path.join(SUPARANK_DIR, 'session.json')
+const CONTENT_DIR = path.join(SUPARANK_DIR, 'content')
+const STATS_FILE = path.join(SUPARANK_DIR, 'stats.json')
 
 // Production API URL
 const DEFAULT_API_URL = 'https://api.suparank.io'
@@ -514,6 +516,165 @@ function showVersion() {
   log('https://suparank.io', 'dim')
 }
 
+function loadStats() {
+  try {
+    if (fs.existsSync(STATS_FILE)) {
+      return JSON.parse(fs.readFileSync(STATS_FILE, 'utf-8'))
+    }
+  } catch (e) {}
+  return { tool_calls: 0, images_generated: 0, articles_created: 0, words_written: 0 }
+}
+
+function loadSession() {
+  try {
+    if (fs.existsSync(SESSION_FILE)) {
+      return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'))
+    }
+  } catch (e) {}
+  return null
+}
+
+function countSavedContent() {
+  try {
+    if (fs.existsSync(CONTENT_DIR)) {
+      const folders = fs.readdirSync(CONTENT_DIR).filter(f => {
+        const stat = fs.statSync(path.join(CONTENT_DIR, f))
+        return stat.isDirectory()
+      })
+      return folders.length
+    }
+  } catch (e) {}
+  return 0
+}
+
+function getRecentContent(limit = 3) {
+  try {
+    if (fs.existsSync(CONTENT_DIR)) {
+      const folders = fs.readdirSync(CONTENT_DIR)
+        .filter(f => fs.statSync(path.join(CONTENT_DIR, f)).isDirectory())
+        .map(f => {
+          const metaPath = path.join(CONTENT_DIR, f, 'metadata.json')
+          let meta = { title: f }
+          try {
+            if (fs.existsSync(metaPath)) {
+              meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
+            }
+          } catch (e) {}
+          return { folder: f, ...meta }
+        })
+        .sort((a, b) => (b.savedAt || '').localeCompare(a.savedAt || ''))
+        .slice(0, limit)
+      return folders
+    }
+  } catch (e) {}
+  return []
+}
+
+async function displayDashboard(config, project) {
+  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf-8'))
+  const credentials = loadCredentials()
+  const session = loadSession()
+  const stats = loadStats()
+  const savedCount = countSavedContent()
+  const recentContent = getRecentContent(3)
+  const projectConfig = project?.config || {}
+
+  // Header
+  console.log()
+  log('╔══════════════════════════════════════════════════════════════════════════════╗', 'cyan')
+  log('║                         🚀 SUPARANK MCP SERVER                               ║', 'cyan')
+  log('╚══════════════════════════════════════════════════════════════════════════════╝', 'cyan')
+  console.log()
+
+  // Version and project info
+  log(`  Version: ${packageJson.version}`, 'dim')
+  log(`  Project: ${colors.bright}${project?.name || config.project_slug}${colors.reset}`, 'reset')
+  log(`  URL: ${projectConfig.site?.url || 'Not set'}`, 'dim')
+  console.log()
+
+  // Project Settings Box
+  log('┌─────────────────────────────────────────────────────────────────────────────┐', 'yellow')
+  log('│  📋 PROJECT SETTINGS (from Supabase)                                        │', 'yellow')
+  log('├─────────────────────────────────────────────────────────────────────────────┤', 'yellow')
+  log(`│  Word Count:      ${String(projectConfig.content?.default_word_count || 'Not set').padEnd(15)} │  Brand Voice: ${String(projectConfig.brand?.voice || 'Not set').substring(0, 25).padEnd(25)}│`, 'reset')
+  log(`│  Reading Level:   ${String(projectConfig.content?.reading_level ? `Grade ${projectConfig.content.reading_level}` : 'Not set').padEnd(15)} │  Target:      ${String(projectConfig.brand?.target_audience || 'Not set').substring(0, 25).padEnd(25)}│`, 'reset')
+  log(`│  Include Images:  ${String(projectConfig.content?.include_images ? 'Yes' : 'No').padEnd(15)} │  Niche:       ${String(projectConfig.site?.niche || 'Not set').substring(0, 25).padEnd(25)}│`, 'reset')
+  log(`│  Keywords:        ${String((projectConfig.seo?.primary_keywords || []).slice(0, 3).join(', ') || 'Not set').substring(0, 56).padEnd(56)}│`, 'reset')
+  log('└─────────────────────────────────────────────────────────────────────────────┘', 'yellow')
+  console.log()
+
+  // Integrations Status
+  log('┌─────────────────────────────────────────────────────────────────────────────┐', 'green')
+  log('│  🔌 INTEGRATIONS                                                            │', 'green')
+  log('├─────────────────────────────────────────────────────────────────────────────┤', 'green')
+
+  const wpStatus = credentials.wordpress?.secret_key || credentials.wordpress?.app_password ? '✅ Enabled' : '❌ Not configured'
+  const ghostStatus = credentials.ghost?.admin_api_key ? '✅ Enabled' : '❌ Not configured'
+  const imageStatus = credentials[credentials.image_provider]?.api_key ? `✅ ${credentials.image_provider}` : '❌ Not configured'
+  const webhookStatus = credentials.webhooks && Object.values(credentials.webhooks).some(Boolean) ? '✅ Enabled' : '❌ Not configured'
+  const externalMcps = credentials.external_mcps?.length || 0
+
+  log(`│  WordPress:     ${wpStatus.padEnd(20)} │  Ghost CMS:    ${ghostStatus.padEnd(20)}│`, 'reset')
+  log(`│  Image Gen:     ${imageStatus.padEnd(20)} │  Webhooks:     ${webhookStatus.padEnd(20)}│`, 'reset')
+  log(`│  External MCPs: ${String(externalMcps > 0 ? `✅ ${externalMcps} configured` : '❌ None').padEnd(58)}│`, 'reset')
+  log('└─────────────────────────────────────────────────────────────────────────────┘', 'green')
+  console.log()
+
+  // Session Status
+  log('┌─────────────────────────────────────────────────────────────────────────────┐', 'magenta')
+  log('│  📝 CURRENT SESSION                                                         │', 'magenta')
+  log('├─────────────────────────────────────────────────────────────────────────────┤', 'magenta')
+
+  if (session && session.articles?.length > 0) {
+    const totalWords = session.articles.reduce((sum, a) => sum + (a.wordCount || 0), 0)
+    const unpublished = session.articles.filter(a => !a.published).length
+    log(`│  Articles: ${String(session.articles.length).padEnd(5)} │  Words: ${String(totalWords).padEnd(8)} │  Unpublished: ${String(unpublished).padEnd(14)}│`, 'reset')
+
+    if (session.articles.length > 0) {
+      const latest = session.articles[session.articles.length - 1]
+      log(`│  Latest:   ${String(`"${latest.title?.substring(0, 45) || 'Untitled'}..."`).padEnd(63)}│`, 'reset')
+    }
+  } else {
+    log(`│  No active session - Start with: "Create a blog post about [topic]"         │`, 'dim')
+  }
+  log('└─────────────────────────────────────────────────────────────────────────────┘', 'magenta')
+  console.log()
+
+  // Recent Content
+  if (recentContent.length > 0) {
+    log('┌─────────────────────────────────────────────────────────────────────────────┐', 'blue')
+    log('│  📚 RECENT CONTENT                                                          │', 'blue')
+    log('├─────────────────────────────────────────────────────────────────────────────┤', 'blue')
+    recentContent.forEach((content, i) => {
+      const title = (content.title || content.folder).substring(0, 50)
+      const words = content.wordCount || '?'
+      const date = content.savedAt ? new Date(content.savedAt).toLocaleDateString() : '?'
+      log(`│  ${i + 1}. ${title.padEnd(50)} ${String(words + ' words').padEnd(12)} ${date.padEnd(10)}│`, 'reset')
+    })
+    log(`│  Total saved: ${String(savedCount + ' articles').padEnd(60)}│`, 'dim')
+    log('└─────────────────────────────────────────────────────────────────────────────┘', 'blue')
+    console.log()
+  }
+
+  // Stats (if available)
+  if (stats.tool_calls > 0 || stats.articles_created > 0) {
+    log('┌─────────────────────────────────────────────────────────────────────────────┐', 'cyan')
+    log('│  📊 USAGE STATS                                                             │', 'cyan')
+    log('├─────────────────────────────────────────────────────────────────────────────┤', 'cyan')
+    log(`│  Tool Calls: ${String(stats.tool_calls).padEnd(10)} │  Articles: ${String(stats.articles_created).padEnd(10)} │  Images: ${String(stats.images_generated).padEnd(10)}│`, 'reset')
+    log(`│  Words Written: ${String(stats.words_written?.toLocaleString() || 0).padEnd(58)}│`, 'reset')
+    log('└─────────────────────────────────────────────────────────────────────────────┘', 'cyan')
+    console.log()
+  }
+
+  // Ready message
+  log('─────────────────────────────────────────────────────────────────────────────', 'dim')
+  log('  MCP Server ready. Waiting for AI client connection...', 'green')
+  log('  Tip: Say "Create a blog post about [topic]" to start', 'dim')
+  log('─────────────────────────────────────────────────────────────────────────────', 'dim')
+  console.log()
+}
+
 async function checkForUpdates(showCurrent = false) {
   const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf-8'))
   const currentVersion = packageJson.version
@@ -590,15 +751,29 @@ async function runUpdate() {
   }
 }
 
-function runMCP() {
+async function runMCP() {
   const config = loadConfig()
 
   if (!config) {
     log('No configuration found. Running setup...', 'yellow')
     console.log()
-    runSetup()
+    await runSetup()
     return
   }
+
+  // Fetch project data for dashboard
+  let project = null
+  try {
+    const result = await testConnection(config.api_key, config.project_slug, config.api_url)
+    if (result.success) {
+      project = result.project
+    }
+  } catch (e) {
+    // Continue without project data
+  }
+
+  // Display dashboard
+  await displayDashboard(config, project)
 
   // Find the MCP client script
   const mcpClientPaths = [
