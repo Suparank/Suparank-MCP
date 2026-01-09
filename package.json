@@ -1,6 +1,6 @@
 {
   "name": "suparank",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "AI-powered SEO content creation MCP - generate and publish optimized blog posts with Claude, ChatGPT, or Cursor",
   "main": "mcp-client.js",
   "type": "module",

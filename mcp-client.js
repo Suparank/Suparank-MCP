@@ -3096,21 +3096,28 @@ async function executeSendWebhook(args) {
 }
 
 /**
- * Essential tools shown in the tool list (5 tools for "stupid simple" UX)
- * Other tools still work when called directly by LLM, but aren't shown in list
+ * Essential tools shown in the tool list
+ * MCP protocol requires tools to be listed for clients to call them
  */
 const VISIBLE_TOOLS = [
+  // Essential (5) - Main workflow
   'create_content',     // Main entry point - creates & publishes automatically
   'keyword_research',   // Research keywords separately (on-demand)
   'generate_image',     // Generate/regenerate images (on-demand)
   'publish_content',    // Manual publish trigger (on-demand)
-  'get_session'         // Check status (on-demand)
+  'get_session',        // Check status (on-demand)
+
+  // Session Management (5) - Content lifecycle
+  'save_content',       // Save article to session
+  'list_content',       // List saved content
+  'load_content',       // Load past content into session
+  'remove_article',     // Remove article from session
+  'clear_session'       // Clear all session content
 ]
 
 /**
  * Get all available tools based on configured credentials
- * Only shows essential tools to users (5 tools instead of 24)
- * Hidden tools still work when LLM calls them directly
+ * Shows 10 essential tools (instead of 24) for cleaner UX
  */
 function getAvailableTools() {
   const tools = []
