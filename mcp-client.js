@@ -1368,6 +1368,21 @@ function buildWorkflowPlan(request, count, publishTo, withImages, project) {
 
   // Extract all settings from project.config (database schema)
   const targetWordCount = config.content?.default_word_count
+
+  // LOG ALL CONFIG VALUES FOR DEBUGGING
+  log('=== PROJECT CONFIG VALUES ===')
+  log(`Word Count Target: ${targetWordCount}`)
+  log(`Reading Level: ${config.content?.reading_level}`)
+  log(`Brand Voice: ${config.brand?.voice}`)
+  log(`Target Audience: ${config.brand?.target_audience}`)
+  log(`Primary Keywords: ${config.seo?.primary_keywords?.join(', ')}`)
+  log(`Include Images: ${config.content?.include_images}`)
+  log('=============================')
+
+  // CRITICAL: Validate word count is set
+  if (!targetWordCount || targetWordCount < 100) {
+    log(`WARNING: Word count not properly set! Got: ${targetWordCount}`)
+  }
   const readingLevel = config.content?.reading_level
   const includeImages = config.content?.include_images
   const brandVoice = config.brand?.voice
@@ -1573,27 +1588,40 @@ Use format: [IMAGE: description of what image should show]` : '**Note:** Images 
     action: 'content_write',
     instruction: `Write the COMPLETE article following your outline.
 
-**⚠️ CRITICAL REQUIREMENTS (from project database):**
-- Word count: **${targetWordCount} words MINIMUM** - Count your words!
-- Reading level: **${readingLevelDisplay}** - Simple sentences, short paragraphs, no jargon
+╔══════════════════════════════════════════════════════════════════╗
+║  🚨 MANDATORY WORD COUNT: ${targetWordCount} WORDS MINIMUM 🚨     ║
+║  This is a strict requirement from the project settings.         ║
+║  The article will be REJECTED if under ${targetWordCount} words. ║
+╚══════════════════════════════════════════════════════════════════╝
+
+**Project Requirements (from Supabase database - DO NOT IGNORE):**
+- Word count: **${targetWordCount} words** (MINIMUM - not a suggestion!)
+- Reading level: **${readingLevelDisplay}** - Simple sentences, short paragraphs
 - Brand voice: ${brandVoice}
 - Target audience: ${targetAudience || 'General readers'}
 
+**To reach ${targetWordCount} words, you MUST:**
+- Write 8-10 substantial H2 sections (each 200-400 words)
+- Include detailed examples, statistics, and actionable advice
+- Add comprehensive FAQ section (5-8 questions)
+- Expand each point with thorough explanations
+
 **Content Structure:**
 - Engaging hook in first 2 sentences
-- All H2/H3 sections from your outline
-- Statistics, examples, and actionable tips in each section
+- All H2/H3 sections from your outline (expand each thoroughly!)
+- Statistics, examples, and actionable tips in EVERY section
 ${shouldGenerateImages ? '- Image placeholders: [IMAGE: description] where images should go' : ''}
-- FAQ section with 4-5 Q&As
+- FAQ section with 5-8 Q&As (detailed answers, not one-liners)
 - Strong conclusion with clear CTA
 
-**After writing, call 'save_content' with:**
+**After writing ${targetWordCount}+ words, call 'save_content' with:**
 - title: Your SEO-optimized title
 - content: The full article (markdown)
 - keywords: Array of target keywords
 - meta_description: Your 150-160 char meta description
 
-⚠️ DO NOT proceed until you've written ${targetWordCount}+ words!`,
+⛔ STOP! Before calling save_content, verify you have ${targetWordCount}+ words.
+   Count the words. If under ${targetWordCount}, ADD MORE CONTENT.`,
     store: 'article'
   })
 
@@ -1804,6 +1832,13 @@ async function executeOrchestratorTool(toolName, args, project) {
 
       let response = `# 🚀 Content Creation Workflow Started
 
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  📊 PROJECT REQUIREMENTS (from Supabase database)                            ║
+║  Word Count: ${String(plan.settings.target_word_count).padEnd(6)} words (MINIMUM - strictly enforced!)      ║
+║  Brand Voice: ${String(plan.settings.brand_voice || 'Not set').substring(0, 50).padEnd(50)}     ║
+║  Target Audience: ${String(plan.settings.target_audience || 'Not set').substring(0, 45).padEnd(45)}     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
 ## Your Request
 "${plan.request}"
 
@@ -1811,7 +1846,7 @@ async function executeOrchestratorTool(toolName, args, project) {
 - **URL:** ${plan.project_info.url}
 - **Niche:** ${plan.project_info.niche}
 
-## Content Settings (from database)
+## Content Settings (from database - DO NOT USE DEFAULTS)
 | Setting | Value |
 |---------|-------|
 | **Word Count** | ${plan.settings.target_word_count} words |
@@ -1907,7 +1942,12 @@ ${plan.steps[0].instruction}
 
       const workflow = sessionState.currentWorkflow
       const targetWordCount = workflow?.settings?.target_word_count
-      const wordCountOk = targetWordCount ? wordCount >= targetWordCount * 0.9 : true // Allow 10% tolerance
+      // Only 5% tolerance - 2500 word target means minimum 2375 words
+      const wordCountOk = targetWordCount ? wordCount >= targetWordCount * 0.95 : true
+      const shortfall = targetWordCount ? targetWordCount - wordCount : 0
+
+      // Log word count check
+      log(`Word count check: ${wordCount} words (target: ${targetWordCount}, ok: ${wordCountOk})`)
 
       // Find next step
       const imageStep = workflow?.steps?.find(s => s.action === 'generate_images')
@@ -1954,7 +1994,19 @@ Use \`publish_content\` to publish all unpublished articles, or \`get_session\` 
 **Keywords:** ${keywords.join(', ') || 'none specified'}
 **Images:** ${newArticle.imageUrl ? '1 cover' : 'no cover'}${newArticle.inlineImages.length > 0 ? ` + ${newArticle.inlineImages.length} inline` : ''}
 
-${targetWordCount && !wordCountOk ? `⚠️ **Warning:** Article is ${targetWordCount - wordCount} words short of the ${targetWordCount} word target.\n` : ''}
+${targetWordCount && !wordCountOk ? `
+╔══════════════════════════════════════════════════════════════════════════╗
+║  ⛔ WORD COUNT NOT MET - ${shortfall} WORDS SHORT!                        ║
+║  Target: ${targetWordCount} words | Actual: ${wordCount} words            ║
+║                                                                          ║
+║  The article does not meet the project's word count requirement.         ║
+║  Please EXPAND the content before publishing:                            ║
+║  - Add more detailed explanations to each section                        ║
+║  - Include additional examples and statistics                            ║
+║  - Expand the FAQ section with more questions                            ║
+║  - Add more H2 sections if needed                                        ║
+╚══════════════════════════════════════════════════════════════════════════╝
+` : ''}
 ${!meta_description ? '⚠️ **Warning:** Meta description is missing. Add it for better SEO.\n' : ''}
 ${articlesListSection}${categoriesSection}
 ## Next Step${includeImages && imageStep ? ': Generate Images' : ': Ready to Publish or Continue'}
