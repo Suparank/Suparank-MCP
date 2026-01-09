@@ -657,7 +657,18 @@ async function callBackendTool(toolName, args) {
 const TOOLS = [
   {
     name: 'keyword_research',
-    description: 'Conduct keyword research and competitive analysis for SEO content. Analyzes search volume, difficulty, and opportunity. If no keyword provided, uses project primary keywords automatically.',
+    description: `Research keywords for SEO. Use ONLY when user specifically asks for keyword research WITHOUT wanting full article creation.
+
+TRIGGERS - Use when user says:
+- "find keywords for..."
+- "research keywords about..."
+- "what keywords should I target for..."
+- "keyword ideas for..."
+- "analyze keywords for..."
+
+DO NOT USE when user wants to write/create content - use create_content instead (it includes keyword research automatically).
+
+OUTCOME: List of keywords with search volume, difficulty, and recommendations.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -908,7 +919,23 @@ const TOOLS = [
 const ACTION_TOOLS = [
   {
     name: 'generate_image',
-    description: 'Generate AI images using configured provider (fal.ai, Gemini Imagen, or wiro.ai). Requires image provider API key in ~/.suparank/credentials.json',
+    description: `Generate AI images. Use when user wants to create, generate, or regenerate images.
+
+TRIGGERS - Use when user says:
+- "create an image for..."
+- "generate image of..."
+- "make a picture of..."
+- "I need an image for..."
+- "regenerate the image"
+- "new hero image"
+- "create thumbnail for..."
+
+NOTE: create_content automatically generates images. Use this tool for:
+- Regenerating/replacing images
+- Creating standalone images
+- Custom image requests outside content workflow
+
+OUTCOME: AI-generated image URL ready for use.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1035,21 +1062,24 @@ const ACTION_TOOLS = [
 const ORCHESTRATOR_TOOLS = [
   {
     name: 'create_content',
-    description: `🚀 MAIN ENTRY POINT - Just tell me what content you want!
+    description: `PRIMARY TOOL for content creation. Use this when user wants to write, create, or generate any content.
 
-Examples:
-- "Write a blog post about AI tools"
-- "Create 3 articles about SEO"
-- "Write content for my project"
+TRIGGERS - Use when user says:
+- "write a blog post about..."
+- "create an article about..."
+- "I need content for..."
+- "help me write about..."
+- "generate a post on..."
+- "make content about..."
+- any request involving writing/creating/generating articles or blog posts
 
-I will automatically:
-1. Research keywords (using SEO MCP if available)
-2. Plan content structure
-3. Guide you through writing
-4. Generate images
-5. Publish to your configured CMS (Ghost/WordPress)
+WORKFLOW (automatic 4-phase):
+1. RESEARCH: Keywords, SEO strategy, content structure
+2. CREATION: Outline, write full article, save to session
+3. OPTIMIZATION: Quality check, GEO optimization for AI search
+4. PUBLISHING: Generate images, publish to WordPress/Ghost
 
-No parameters needed - I use your project settings automatically!`,
+OUTCOME: Complete article written, optimized, and published to CMS.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1078,7 +1108,16 @@ No parameters needed - I use your project settings automatically!`,
   },
   {
     name: 'save_content',
-    description: 'Save generated content to session for publishing. Call this after you finish writing an article.',
+    description: `Save written article to session. Use after manually writing content outside create_content workflow.
+
+TRIGGERS - Use when:
+- You wrote an article manually and need to save it
+- User says "save this article" / "save my content"
+- Saving edited/revised content
+
+NOTE: create_content saves automatically. Only use this for manual saves.
+
+OUTCOME: Article saved to session, ready for publishing.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1105,7 +1144,21 @@ No parameters needed - I use your project settings automatically!`,
   },
   {
     name: 'publish_content',
-    description: 'Publish saved articles to configured CMS platforms. Publishes ALL unpublished articles in the session by default, or specific articles by index.',
+    description: `Publish articles to WordPress/Ghost. Use when user wants to publish saved content.
+
+TRIGGERS - Use when user says:
+- "publish my article"
+- "post this to WordPress/Ghost"
+- "publish to my blog"
+- "make it live"
+- "publish as draft"
+
+NOTE: create_content publishes automatically. Use this for:
+- Manual publishing control
+- Re-publishing edited content
+- Publishing specific articles from session
+
+OUTCOME: Article published to configured CMS platforms.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1135,7 +1188,16 @@ No parameters needed - I use your project settings automatically!`,
   },
   {
     name: 'get_session',
-    description: 'Get current session state - see what content and images have been created.',
+    description: `View current session status. Shows saved articles, images, and publishing state.
+
+TRIGGERS - Use when user says:
+- "what's in my session"
+- "show my articles"
+- "what have I created"
+- "session status"
+- "list my saved content"
+
+OUTCOME: List of all articles in session with their publish status.`,
     inputSchema: {
       type: 'object',
       properties: {}
@@ -1143,7 +1205,15 @@ No parameters needed - I use your project settings automatically!`,
   },
   {
     name: 'remove_article',
-    description: 'Remove specific article(s) from the session by number. Does not affect published articles.',
+    description: `Remove article(s) from session. Does NOT delete published content.
+
+TRIGGERS - Use when user says:
+- "remove article 2"
+- "delete the second article"
+- "remove that article"
+- "discard article..."
+
+OUTCOME: Specified article(s) removed from session.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1158,7 +1228,18 @@ No parameters needed - I use your project settings automatically!`,
   },
   {
     name: 'clear_session',
-    description: 'Clear all articles and reset session. Use with caution - this removes all unpublished content!',
+    description: `Clear ALL content from session. DESTRUCTIVE - removes all unpublished articles!
+
+TRIGGERS - Use when user says:
+- "clear my session"
+- "start fresh"
+- "remove all articles"
+- "reset everything"
+- "clear all content"
+
+WARNING: Requires confirm: true. Does NOT affect already-published content.
+
+OUTCOME: Empty session, ready for new content creation.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1172,7 +1253,18 @@ No parameters needed - I use your project settings automatically!`,
   },
   {
     name: 'list_content',
-    description: 'List all previously saved content from ~/.suparank/content/. Shows articles that can be loaded back into session for further optimization.',
+    description: `List all saved content from disk. Shows past articles that can be loaded back.
+
+TRIGGERS - Use when user says:
+- "show my past articles"
+- "list saved content"
+- "what articles do I have"
+- "show previous content"
+- "find my old articles"
+
+NOTE: Different from get_session - this shows DISK storage, not current session.
+
+OUTCOME: List of saved article folders with titles and dates.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1186,7 +1278,18 @@ No parameters needed - I use your project settings automatically!`,
   },
   {
     name: 'load_content',
-    description: 'Load a previously saved article back into the session. Use list_content first to see available articles. Once loaded, you can run optimization tools like quality_check, geo_optimize, internal_links, schema_generate on it.',
+    description: `Load a saved article back into session for editing or re-publishing.
+
+TRIGGERS - Use when user says:
+- "load my article about..."
+- "open the previous article"
+- "bring back that article"
+- "edit my old post about..."
+- "reload article..."
+
+WORKFLOW: Run list_content first to see available articles, then load by folder name.
+
+OUTCOME: Article loaded into session, ready for optimization or re-publishing.`,
     inputSchema: {
       type: 'object',
       properties: {
