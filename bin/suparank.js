@@ -22,7 +22,7 @@ const CONFIG_FILE = path.join(SUPARANK_DIR, 'config.json')
 const CREDENTIALS_FILE = path.join(SUPARANK_DIR, 'credentials.json')
 const SESSION_FILE = path.join(SUPARANK_DIR, 'session.json')
 
-// Colors for terminal output
+// Colors for terminal output (only used in interactive commands)
 const colors = {
   reset: '\x1b[0m',
   bright: '\x1b[1m',
@@ -34,14 +34,27 @@ const colors = {
   cyan: '\x1b[36m'
 }
 
+// Check if running in MCP mode (no command argument = MCP server)
+const isMCPMode = !process.argv[2] || !['setup', 'test', 'session', 'clear', 'help', '--help', '-h'].includes(process.argv[2])
+
 function log(message, color = 'reset') {
-  console.log(`${colors[color]}${message}${colors.reset}`)
+  // In MCP mode, use stderr to avoid breaking JSON protocol
+  // In interactive mode (setup, test, etc), use stdout for user-friendly output
+  if (isMCPMode) {
+    console.error(`[suparank] ${message}`)
+  } else {
+    console.log(`${colors[color]}${message}${colors.reset}`)
+  }
 }
 
 function logHeader(message) {
-  console.log()
-  log(`=== ${message} ===`, 'bright')
-  console.log()
+  if (isMCPMode) {
+    console.error(`[suparank] === ${message} ===`)
+  } else {
+    console.log()
+    log(`=== ${message} ===`, 'bright')
+    console.log()
+  }
 }
 
 function ensureDir() {
@@ -335,10 +348,9 @@ function runMCP() {
   const config = loadConfig()
 
   if (!config) {
-    log('No configuration found. Running setup...', 'yellow')
-    console.log()
-    runSetup()
-    return
+    // No config - exit with error (user needs to run setup first)
+    console.error('[suparank] No configuration found. Run: npx suparank setup')
+    process.exit(1)
   }
 
   // Find the MCP client script (modular version)
@@ -359,13 +371,15 @@ function runMCP() {
   }
 
   if (!mcpClientPath) {
-    log('Error: mcp-client not found', 'red')
+    console.error('[suparank] Error: mcp-client not found')
     process.exit(1)
   }
 
   // Launch MCP client with config
+  // Use 'pipe' for stdin/stdout to properly handle MCP protocol
+  // stderr is inherited for logging
   const child = spawn('node', [mcpClientPath, config.project_slug, config.api_key], {
-    stdio: 'inherit',
+    stdio: ['inherit', 'inherit', 'inherit'],
     env: {
       ...process.env,
       SUPARANK_API_URL: config.api_url
@@ -373,7 +387,7 @@ function runMCP() {
   })
 
   child.on('error', (err) => {
-    console.error('Failed to start MCP client:', err.message)
+    console.error('[suparank] Failed to start MCP client:', err.message)
     process.exit(1)
   })
 
