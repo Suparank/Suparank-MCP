@@ -1,22 +1,33 @@
+#!/usr/bin/env node
+
 /**
  * Suparank MCP - Main Entry Point
  *
  * Modular MCP server for AI-powered SEO content creation
  *
- * This file re-exports from modular components and provides the main entry point.
- * For now, the main server logic is still in ../mcp-client.js but will be
- * migrated incrementally.
+ * Usage:
+ *   npx suparank
+ *   node mcp-client/index.js <project-slug> <api-key>
+ *
+ * Credentials:
+ *   Local credentials are loaded from ~/.suparank/credentials.json
+ *   These enable additional tools: image generation, CMS publishing, webhooks
  */
 
-// Re-export config
+import { main } from './server.js'
+import { log } from './utils/logging.js'
+
+// Re-export modules for external use
 export * from './config.js'
-
-// Re-export utils
 export * from './utils/index.js'
-
-// Re-export services
 export * from './services/index.js'
+export * from './tools/index.js'
+export * from './handlers/index.js'
+export * from './publishers/index.js'
+export * from './workflow/index.js'
 
-// Main entry - for now, delegate to the original mcp-client.js
-// This will be replaced with modular server setup in future versions
-import '../mcp-client.js'
+// Run server
+main().catch((error) => {
+  log('Fatal error:', error)
+  process.exit(1)
+})

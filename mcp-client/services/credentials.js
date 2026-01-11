@@ -125,3 +125,25 @@ export function getProviderConfig(provider) {
 export function clearCredentialsCache() {
   localCredentials = null
 }
+
+/**
+ * Get list of external MCPs configured
+ * @returns {Array} Array of external MCP configurations
+ */
+export function getExternalMCPs() {
+  const creds = getCredentials()
+  return creds?.external_mcps || []
+}
+
+/**
+ * Get composition hints for a specific tool
+ * @param {string} toolName - Tool name to get hints for
+ * @returns {string|null} Composition hints or null
+ */
+export function getCompositionHints(toolName) {
+  const creds = getCredentials()
+  if (!creds?.tool_instructions) return null
+
+  const instruction = creds.tool_instructions.find(t => t.tool_name === toolName)
+  return instruction?.composition_hints || null
+}

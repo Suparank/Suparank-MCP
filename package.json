@@ -1,24 +1,17 @@
 {
   "name": "suparank",
-  "version": "1.2.6",
-  "description": "AI-powered SEO content creation MCP - generate and publish optimized blog posts with Claude, ChatGPT, or Cursor",
-  "main": "mcp-client.js",
+  "version": "1.2.7",
+  "description": "AI-powered SEO content creation MCP - generate and publish optimized blog posts with your AI assistant",
   "type": "module",
   "bin": {
     "suparank": "./bin/suparank.js"
   },
   "files": [
     "bin/",
-    "mcp-client.js",
     "mcp-client/",
     "credentials.example.json",
-    "README.md",
-    "LICENSE"
+    "README.md"
   ],
-  "scripts": {
-    "start": "node mcp-client.js",
-    "test": "node bin/suparank.js test"
-  },
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -31,18 +24,13 @@
     "blog",
     "wordpress",
     "ghost",
-    "content-generation",
-    "anthropic",
-    "openai"
+    "content-generation"
   ],
-  "author": "Suparank <hello@suparank.io>",
+  "author": "Suparank",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Suparank/Suparank-MCP.git"
-  },
-  "bugs": {
-    "url": "https://github.com/Suparank/Suparank-MCP/issues"
+    "url": "https://github.com/Suparank/Suparank-MCP.git"
   },
   "homepage": "https://suparank.io",
   "dependencies": {
@@ -50,6 +38,6 @@
     "marked": "^15.0.12"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

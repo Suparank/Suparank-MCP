@@ -6,11 +6,9 @@
  * Usage:
  *   npx suparank              - Run MCP (or setup if first time)
  *   npx suparank setup        - Run setup wizard
- *   npx suparank credentials  - Configure local credentials (WordPress, Ghost, etc.)
  *   npx suparank test         - Test API connection
  *   npx suparank session      - View current session state
  *   npx suparank clear        - Clear session state
- *   npx suparank update       - Check for updates and install latest version
  */
 
 import * as fs from 'fs'
@@ -23,11 +21,6 @@ const SUPARANK_DIR = path.join(os.homedir(), '.suparank')
 const CONFIG_FILE = path.join(SUPARANK_DIR, 'config.json')
 const CREDENTIALS_FILE = path.join(SUPARANK_DIR, 'credentials.json')
 const SESSION_FILE = path.join(SUPARANK_DIR, 'session.json')
-const CONTENT_DIR = path.join(SUPARANK_DIR, 'content')
-const STATS_FILE = path.join(SUPARANK_DIR, 'stats.json')
-
-// Production API URL
-const DEFAULT_API_URL = 'https://api.suparank.io'
 
 // Colors for terminal output
 const colors = {
@@ -38,8 +31,7 @@ const colors = {
   yellow: '\x1b[33m',
   blue: '\x1b[34m',
   red: '\x1b[31m',
-  cyan: '\x1b[36m',
-  magenta: '\x1b[35m'
+  cyan: '\x1b[36m'
 }
 
 function log(message, color = 'reset') {
@@ -48,14 +40,8 @@ function log(message, color = 'reset') {
 
 function logHeader(message) {
   console.log()
-  log(`${'='.repeat(50)}`, 'cyan')
-  log(`  ${message}`, 'bright')
-  log(`${'='.repeat(50)}`, 'cyan')
+  log(`=== ${message} ===`, 'bright')
   console.log()
-}
-
-function logStep(step, total, message) {
-  log(`[${step}/${total}] ${message}`, 'yellow')
 }
 
 function ensureDir() {
@@ -85,17 +71,20 @@ function loadCredentials() {
     if (fs.existsSync(CREDENTIALS_FILE)) {
       return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf-8'))
     }
+    // Try legacy .env.superwriter
+    const legacyPaths = [
+      path.join(os.homedir(), '.env.superwriter'),
+      path.join(process.cwd(), '.env.superwriter')
+    ]
+    for (const legacyPath of legacyPaths) {
+      if (fs.existsSync(legacyPath)) {
+        return JSON.parse(fs.readFileSync(legacyPath, 'utf-8'))
+      }
+    }
   } catch (e) {
     // Ignore errors
   }
-  return {}
-}
-
-function saveCredentials(credentials) {
-  ensureDir()
-  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(credentials, null, 2))
-  // Set restrictive permissions
-  fs.chmodSync(CREDENTIALS_FILE, 0o600)
+  return null
 }
 
 function prompt(question) {
@@ -111,48 +100,9 @@ function prompt(question) {
   })
 }
 
-function promptPassword(question) {
-  return new Promise(resolve => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout
-    })
-
-    // Hide input for passwords
-    process.stdout.write(question)
-    let password = ''
-
-    process.stdin.setRawMode(true)
-    process.stdin.resume()
-    process.stdin.setEncoding('utf8')
-
-    const onData = (char) => {
-      if (char === '\n' || char === '\r') {
-        process.stdin.setRawMode(false)
-        process.stdin.removeListener('data', onData)
-        rl.close()
-        console.log()
-        resolve(password)
-      } else if (char === '\u0003') {
-        process.exit()
-      } else if (char === '\u007F') {
-        password = password.slice(0, -1)
-        process.stdout.clearLine(0)
-        process.stdout.cursorTo(0)
-        process.stdout.write(question + '*'.repeat(password.length))
-      } else {
-        password += char
-        process.stdout.write('*')
-      }
-    }
-
-    process.stdin.on('data', onData)
-  })
-}
-
 async function testConnection(apiKey, projectSlug, apiUrl = null) {
   try {
-    const url = apiUrl || DEFAULT_API_URL
+    const url = apiUrl || process.env.SUPARANK_API_URL || 'http://localhost:3000'
     const response = await fetch(`${url}/projects/${projectSlug}`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -162,6 +112,7 @@ async function testConnection(apiKey, projectSlug, apiUrl = null) {
 
     if (response.ok) {
       const data = await response.json()
+      // API returns { project: {...} }
       const project = data.project || data
       return { success: true, project }
     } else {
@@ -176,20 +127,13 @@ async function testConnection(apiKey, projectSlug, apiUrl = null) {
 async function runSetup() {
   logHeader('Suparank Setup Wizard')
 
-  log('Welcome to Suparank! ', 'green')
-  log('AI-powered SEO content creation for your blog.', 'dim')
-  console.log()
-  log('This wizard will help you:', 'cyan')
-  log('  1. Connect to your Suparank account', 'dim')
-  log('  2. Configure your project', 'dim')
-  log('  3. Set up local integrations (optional)', 'dim')
+  log('Welcome to Suparank!', 'cyan')
+  log('This wizard will help you configure your MCP client.', 'dim')
   console.log()
 
-  // Step 1: API Key
-  logStep(1, 3, 'Suparank Account')
-  console.log()
-  log('Get your API key from:', 'dim')
-  log('  https://suparank.io/dashboard/settings/api-keys', 'cyan')
+  // Step 1: Get API key
+  log('Step 1: API Key', 'bright')
+  log('Get your API key from: https://suparank.io/dashboard/settings/api-keys', 'dim')
   console.log()
 
   const apiKey = await prompt('Enter your API key: ')
@@ -198,78 +142,80 @@ async function runSetup() {
     process.exit(1)
   }
 
-  // Validate API key format
-  if (!apiKey.startsWith('sk_live_') && !apiKey.startsWith('sk_test_')) {
-    log('Invalid API key format. Keys must start with sk_live_ or sk_test_', 'red')
-    process.exit(1)
-  }
-
-  // Step 2: Project slug
+  // Step 2: Get project slug
   console.log()
-  logStep(2, 3, 'Project Selection')
-  console.log()
+  log('Step 2: Project', 'bright')
   log('Enter your project slug (from your dashboard URL)', 'dim')
-  log('Example: my-blog-abc123', 'dim')
   console.log()
 
-  const projectSlug = await prompt('Project slug: ')
+  const projectSlug = await prompt('Enter project slug: ')
   if (!projectSlug) {
     log('Project slug is required. Exiting.', 'red')
     process.exit(1)
   }
 
+  // Step 3: API URL (optional)
+  console.log()
+  log('Step 3: API URL (optional)', 'bright')
+  log('Press Enter for default, or enter custom URL for self-hosted/development', 'dim')
+  const defaultUrl = process.env.SUPARANK_API_URL || 'http://localhost:3000'
+  console.log()
+
+  const apiUrlInput = await prompt(`API URL [${defaultUrl}]: `)
+  const apiUrl = apiUrlInput || defaultUrl
+
   // Test connection
   console.log()
   log('Testing connection...', 'yellow')
 
-  const result = await testConnection(apiKey, projectSlug, DEFAULT_API_URL)
+  const result = await testConnection(apiKey, projectSlug, apiUrl)
 
   if (!result.success) {
     log(`Connection failed: ${result.error}`, 'red')
-    log('Please check your API key and project slug.', 'dim')
+    log('Please check your API key, project slug, and API URL.', 'dim')
     process.exit(1)
   }
 
-  log(`Connected to: ${result.project.name}`, 'green')
+  log(`Connected to project: ${result.project.name}`, 'green')
 
   // Save config
   const config = {
     api_key: apiKey,
     project_slug: projectSlug,
-    api_url: DEFAULT_API_URL,
+    api_url: apiUrl,
     created_at: new Date().toISOString()
   }
 
   saveConfig(config)
   log('Configuration saved!', 'green')
 
-  // Step 3: Local credentials (optional)
+  // Step 3: Optional credentials
   console.log()
-  logStep(3, 3, 'Local Integrations (Optional)')
-  console.log()
-  log('Set up local integrations for:', 'dim')
-  log('  - Image generation (fal.ai, Gemini, wiro.ai)', 'dim')
-  log('  - WordPress publishing', 'dim')
-  log('  - Ghost CMS publishing', 'dim')
-  log('  - Webhooks (Make, n8n, Zapier, Slack)', 'dim')
+  log('Step 3: Local Credentials (optional)', 'bright')
+  log('For image generation and CMS publishing, create:', 'dim')
+  log(`  ${CREDENTIALS_FILE}`, 'cyan')
   console.log()
 
-  const setupCreds = await prompt('Configure integrations now? (y/N): ')
-
-  if (setupCreds.toLowerCase() === 'y') {
-    await runCredentialsSetup()
-  } else {
-    log('You can configure integrations later with: npx suparank credentials', 'dim')
+  log('Example credentials.json:', 'dim')
+  console.log(`{
+  "image_provider": "fal",
+  "fal": { "api_key": "YOUR_FAL_KEY" },
+  "wordpress": {
+    "site_url": "https://your-site.com",
+    "secret_key": "FROM_PLUGIN_SETTINGS"
+  },
+  "ghost": {
+    "api_url": "https://your-ghost.com",
+    "admin_api_key": "YOUR_GHOST_ADMIN_KEY"
   }
+}`)
 
-  // Final instructions
+  console.log()
   logHeader('Setup Complete!')
 
   log('Add Suparank to your AI client:', 'bright')
   console.log()
-
-  log('For Claude Desktop:', 'cyan')
-  log('Edit ~/.config/claude/claude_desktop_config.json:', 'dim')
+  log('For Claude Desktop (claude_desktop_config.json):', 'dim')
   console.log(`{
   "mcpServers": {
     "suparank": {
@@ -280,8 +226,7 @@ async function runSetup() {
 }`)
 
   console.log()
-  log('For Cursor:', 'cyan')
-  log('Add to your MCP settings:', 'dim')
+  log('For Cursor (settings.json):', 'dim')
   console.log(`{
   "mcpServers": {
     "suparank": {
@@ -293,133 +238,11 @@ async function runSetup() {
 
   console.log()
   log('Commands:', 'bright')
-  log('  npx suparank              Run MCP server', 'dim')
-  log('  npx suparank setup        Re-run setup', 'dim')
-  log('  npx suparank credentials  Configure integrations', 'dim')
-  log('  npx suparank test         Test connection', 'dim')
-  log('  npx suparank session      View session state', 'dim')
-  log('  npx suparank clear        Clear session', 'dim')
-  console.log()
-  log('Documentation: https://suparank.io/docs', 'cyan')
-}
-
-async function runCredentialsSetup() {
-  logHeader('Configure Integrations')
-
-  const credentials = loadCredentials()
-
-  // Image Generation
-  log('Image Generation', 'bright')
-  log('Generate AI images for your blog posts', 'dim')
-  console.log()
-  log('Providers:', 'cyan')
-  log('  1. fal.ai (recommended) - Fast, high quality', 'dim')
-  log('  2. wiro.ai - Google Imagen via API', 'dim')
-  log('  3. Gemini - Google AI directly', 'dim')
-  log('  4. Skip', 'dim')
-  console.log()
-
-  const imageChoice = await prompt('Choose provider (1-4): ')
-
-  if (imageChoice === '1') {
-    const apiKey = await prompt('fal.ai API key: ')
-    if (apiKey) {
-      credentials.image_provider = 'fal'
-      credentials.fal = { api_key: apiKey }
-      log('fal.ai configured!', 'green')
-    }
-  } else if (imageChoice === '2') {
-    const apiKey = await prompt('wiro.ai API key: ')
-    const apiSecret = await prompt('wiro.ai API secret: ')
-    if (apiKey && apiSecret) {
-      credentials.image_provider = 'wiro'
-      credentials.wiro = {
-        api_key: apiKey,
-        api_secret: apiSecret,
-        model: 'google/nano-banana-pro'
-      }
-      log('wiro.ai configured!', 'green')
-    }
-  } else if (imageChoice === '3') {
-    const apiKey = await prompt('Google AI API key: ')
-    if (apiKey) {
-      credentials.image_provider = 'gemini'
-      credentials.gemini = { api_key: apiKey }
-      log('Gemini configured!', 'green')
-    }
-  }
-
-  // WordPress
-  console.log()
-  log('WordPress Publishing', 'bright')
-  log('Publish directly to your WordPress site', 'dim')
-  console.log()
-
-  const setupWP = await prompt('Configure WordPress? (y/N): ')
-  if (setupWP.toLowerCase() === 'y') {
-    log('Install the Suparank Connector plugin from:', 'dim')
-    log('  https://suparank.io/wordpress-plugin', 'cyan')
-    console.log()
-
-    const siteUrl = await prompt('WordPress site URL (https://your-site.com): ')
-    const secretKey = await prompt('Plugin secret key (from plugin settings): ')
-
-    if (siteUrl && secretKey) {
-      credentials.wordpress = {
-        site_url: siteUrl.replace(/\/$/, ''),
-        secret_key: secretKey
-      }
-      log('WordPress configured!', 'green')
-    }
-  }
-
-  // Ghost
-  console.log()
-  log('Ghost CMS Publishing', 'bright')
-  log('Publish directly to your Ghost blog', 'dim')
-  console.log()
-
-  const setupGhost = await prompt('Configure Ghost? (y/N): ')
-  if (setupGhost.toLowerCase() === 'y') {
-    const apiUrl = await prompt('Ghost site URL (https://your-ghost.com): ')
-    const adminKey = await prompt('Admin API key (from Ghost settings): ')
-
-    if (apiUrl && adminKey) {
-      credentials.ghost = {
-        api_url: apiUrl.replace(/\/$/, ''),
-        admin_api_key: adminKey
-      }
-      log('Ghost configured!', 'green')
-    }
-  }
-
-  // Webhooks
-  console.log()
-  log('Webhooks (Optional)', 'bright')
-  log('Send notifications to Make, n8n, Zapier, or Slack', 'dim')
-  console.log()
-
-  const setupWebhooks = await prompt('Configure webhooks? (y/N): ')
-  if (setupWebhooks.toLowerCase() === 'y') {
-    credentials.webhooks = credentials.webhooks || {}
-
-    const slackUrl = await prompt('Slack webhook URL (or Enter to skip): ')
-    if (slackUrl) credentials.webhooks.slack_url = slackUrl
-
-    const makeUrl = await prompt('Make.com webhook URL (or Enter to skip): ')
-    if (makeUrl) credentials.webhooks.make_url = makeUrl
-
-    const zapierUrl = await prompt('Zapier webhook URL (or Enter to skip): ')
-    if (zapierUrl) credentials.webhooks.zapier_url = zapierUrl
-
-    log('Webhooks configured!', 'green')
-  }
-
-  // Save credentials
-  saveCredentials(credentials)
-  console.log()
-  log('Credentials saved to ~/.suparank/credentials.json', 'green')
-  log('File permissions set to owner-only (600)', 'dim')
+  log('  npx suparank         - Run MCP server', 'dim')
+  log('  npx suparank setup   - Run setup again', 'dim')
+  log('  npx suparank test    - Test API connection', 'dim')
+  log('  npx suparank session - View session state', 'dim')
+  log('  npx suparank clear   - Clear session', 'dim')
 }
 
 async function runTest() {
@@ -440,22 +263,20 @@ async function runTest() {
 
   if (result.success) {
     log(`Success! Connected to: ${result.project.name}`, 'green')
-    console.log()
 
     // Check credentials
     const creds = loadCredentials()
-    const configured = []
-    if (creds.wordpress?.secret_key) configured.push('WordPress')
-    if (creds.ghost?.admin_api_key) configured.push('Ghost')
-    if (creds[creds.image_provider]?.api_key) configured.push(`Images (${creds.image_provider})`)
-    if (creds.webhooks && Object.values(creds.webhooks).some(Boolean)) configured.push('Webhooks')
+    if (creds) {
+      const configured = []
+      if (creds.wordpress?.secret_key) configured.push('WordPress')
+      if (creds.ghost?.admin_api_key) configured.push('Ghost')
+      if (creds[creds.image_provider]?.api_key) configured.push(`Images (${creds.image_provider})`)
 
-    if (configured.length > 0) {
-      log('Local integrations:', 'cyan')
-      configured.forEach(c => log(`  - ${c}`, 'green'))
+      if (configured.length > 0) {
+        log(`Local integrations: ${configured.join(', ')}`, 'green')
+      }
     } else {
-      log('No local integrations configured', 'dim')
-      log('Run: npx suparank credentials', 'dim')
+      log('No local credentials configured (optional)', 'dim')
     }
   } else {
     log(`Connection failed: ${result.error}`, 'red')
@@ -510,273 +331,21 @@ function clearSession() {
   }
 }
 
-function showVersion() {
-  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf-8'))
-  log(`Suparank MCP v${packageJson.version}`, 'cyan')
-  log('https://suparank.io', 'dim')
-}
-
-function loadStats() {
-  try {
-    if (fs.existsSync(STATS_FILE)) {
-      return JSON.parse(fs.readFileSync(STATS_FILE, 'utf-8'))
-    }
-  } catch (e) {}
-  return { tool_calls: 0, images_generated: 0, articles_created: 0, words_written: 0 }
-}
-
-function loadSession() {
-  try {
-    if (fs.existsSync(SESSION_FILE)) {
-      return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'))
-    }
-  } catch (e) {}
-  return null
-}
-
-function countSavedContent() {
-  try {
-    if (fs.existsSync(CONTENT_DIR)) {
-      const folders = fs.readdirSync(CONTENT_DIR).filter(f => {
-        const stat = fs.statSync(path.join(CONTENT_DIR, f))
-        return stat.isDirectory()
-      })
-      return folders.length
-    }
-  } catch (e) {}
-  return 0
-}
-
-function getRecentContent(limit = 3) {
-  try {
-    if (fs.existsSync(CONTENT_DIR)) {
-      const folders = fs.readdirSync(CONTENT_DIR)
-        .filter(f => fs.statSync(path.join(CONTENT_DIR, f)).isDirectory())
-        .map(f => {
-          const metaPath = path.join(CONTENT_DIR, f, 'metadata.json')
-          let meta = { title: f }
-          try {
-            if (fs.existsSync(metaPath)) {
-              meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'))
-            }
-          } catch (e) {}
-          return { folder: f, ...meta }
-        })
-        .sort((a, b) => (b.savedAt || '').localeCompare(a.savedAt || ''))
-        .slice(0, limit)
-      return folders
-    }
-  } catch (e) {}
-  return []
-}
-
-async function displayDashboard(config, project) {
-  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf-8'))
-  const credentials = loadCredentials()
-  const session = loadSession()
-  const stats = loadStats()
-  const savedCount = countSavedContent()
-  const recentContent = getRecentContent(3)
-  const projectConfig = project?.config || {}
-
-  // Header
-  console.log()
-  log('╔══════════════════════════════════════════════════════════════════════════════╗', 'cyan')
-  log('║                         🚀 SUPARANK MCP SERVER                               ║', 'cyan')
-  log('╚══════════════════════════════════════════════════════════════════════════════╝', 'cyan')
-  console.log()
-
-  // Version and project info
-  log(`  Version: ${packageJson.version}`, 'dim')
-  log(`  Project: ${colors.bright}${project?.name || config.project_slug}${colors.reset}`, 'reset')
-  log(`  URL: ${projectConfig.site?.url || 'Not set'}`, 'dim')
-  console.log()
-
-  // Project Settings Box
-  log('┌─────────────────────────────────────────────────────────────────────────────┐', 'yellow')
-  log('│  📋 PROJECT SETTINGS (from Supabase)                                        │', 'yellow')
-  log('├─────────────────────────────────────────────────────────────────────────────┤', 'yellow')
-  log(`│  Word Count:      ${String(projectConfig.content?.default_word_count || 'Not set').padEnd(15)} │  Brand Voice: ${String(projectConfig.brand?.voice || 'Not set').substring(0, 25).padEnd(25)}│`, 'reset')
-  log(`│  Reading Level:   ${String(projectConfig.content?.reading_level ? `Grade ${projectConfig.content.reading_level}` : 'Not set').padEnd(15)} │  Target:      ${String(projectConfig.brand?.target_audience || 'Not set').substring(0, 25).padEnd(25)}│`, 'reset')
-  log(`│  Include Images:  ${String(projectConfig.content?.include_images ? 'Yes' : 'No').padEnd(15)} │  Niche:       ${String(projectConfig.site?.niche || 'Not set').substring(0, 25).padEnd(25)}│`, 'reset')
-  log(`│  Keywords:        ${String((projectConfig.seo?.primary_keywords || []).slice(0, 3).join(', ') || 'Not set').substring(0, 56).padEnd(56)}│`, 'reset')
-  log('└─────────────────────────────────────────────────────────────────────────────┘', 'yellow')
-  console.log()
-
-  // Integrations Status
-  log('┌─────────────────────────────────────────────────────────────────────────────┐', 'green')
-  log('│  🔌 INTEGRATIONS                                                            │', 'green')
-  log('├─────────────────────────────────────────────────────────────────────────────┤', 'green')
-
-  const wpStatus = credentials.wordpress?.secret_key || credentials.wordpress?.app_password ? '✅ Enabled' : '❌ Not configured'
-  const ghostStatus = credentials.ghost?.admin_api_key ? '✅ Enabled' : '❌ Not configured'
-  const imageStatus = credentials[credentials.image_provider]?.api_key ? `✅ ${credentials.image_provider}` : '❌ Not configured'
-  const webhookStatus = credentials.webhooks && Object.values(credentials.webhooks).some(Boolean) ? '✅ Enabled' : '❌ Not configured'
-  const externalMcps = credentials.external_mcps?.length || 0
-
-  log(`│  WordPress:     ${wpStatus.padEnd(20)} │  Ghost CMS:    ${ghostStatus.padEnd(20)}│`, 'reset')
-  log(`│  Image Gen:     ${imageStatus.padEnd(20)} │  Webhooks:     ${webhookStatus.padEnd(20)}│`, 'reset')
-  log(`│  External MCPs: ${String(externalMcps > 0 ? `✅ ${externalMcps} configured` : '❌ None').padEnd(58)}│`, 'reset')
-  log('└─────────────────────────────────────────────────────────────────────────────┘', 'green')
-  console.log()
-
-  // Session Status
-  log('┌─────────────────────────────────────────────────────────────────────────────┐', 'magenta')
-  log('│  📝 CURRENT SESSION                                                         │', 'magenta')
-  log('├─────────────────────────────────────────────────────────────────────────────┤', 'magenta')
-
-  if (session && session.articles?.length > 0) {
-    const totalWords = session.articles.reduce((sum, a) => sum + (a.wordCount || 0), 0)
-    const unpublished = session.articles.filter(a => !a.published).length
-    log(`│  Articles: ${String(session.articles.length).padEnd(5)} │  Words: ${String(totalWords).padEnd(8)} │  Unpublished: ${String(unpublished).padEnd(14)}│`, 'reset')
-
-    if (session.articles.length > 0) {
-      const latest = session.articles[session.articles.length - 1]
-      log(`│  Latest:   ${String(`"${latest.title?.substring(0, 45) || 'Untitled'}..."`).padEnd(63)}│`, 'reset')
-    }
-  } else {
-    log(`│  No active session - Start with: "Create a blog post about [topic]"         │`, 'dim')
-  }
-  log('└─────────────────────────────────────────────────────────────────────────────┘', 'magenta')
-  console.log()
-
-  // Recent Content
-  if (recentContent.length > 0) {
-    log('┌─────────────────────────────────────────────────────────────────────────────┐', 'blue')
-    log('│  📚 RECENT CONTENT                                                          │', 'blue')
-    log('├─────────────────────────────────────────────────────────────────────────────┤', 'blue')
-    recentContent.forEach((content, i) => {
-      const title = (content.title || content.folder).substring(0, 50)
-      const words = content.wordCount || '?'
-      const date = content.savedAt ? new Date(content.savedAt).toLocaleDateString() : '?'
-      log(`│  ${i + 1}. ${title.padEnd(50)} ${String(words + ' words').padEnd(12)} ${date.padEnd(10)}│`, 'reset')
-    })
-    log(`│  Total saved: ${String(savedCount + ' articles').padEnd(60)}│`, 'dim')
-    log('└─────────────────────────────────────────────────────────────────────────────┘', 'blue')
-    console.log()
-  }
-
-  // Stats (if available)
-  if (stats.tool_calls > 0 || stats.articles_created > 0) {
-    log('┌─────────────────────────────────────────────────────────────────────────────┐', 'cyan')
-    log('│  📊 USAGE STATS                                                             │', 'cyan')
-    log('├─────────────────────────────────────────────────────────────────────────────┤', 'cyan')
-    log(`│  Tool Calls: ${String(stats.tool_calls).padEnd(10)} │  Articles: ${String(stats.articles_created).padEnd(10)} │  Images: ${String(stats.images_generated).padEnd(10)}│`, 'reset')
-    log(`│  Words Written: ${String(stats.words_written?.toLocaleString() || 0).padEnd(58)}│`, 'reset')
-    log('└─────────────────────────────────────────────────────────────────────────────┘', 'cyan')
-    console.log()
-  }
-
-  // Ready message
-  log('─────────────────────────────────────────────────────────────────────────────', 'dim')
-  log('  MCP Server ready. Waiting for AI client connection...', 'green')
-  log('  Tip: Say "Create a blog post about [topic]" to start', 'dim')
-  log('─────────────────────────────────────────────────────────────────────────────', 'dim')
-  console.log()
-}
-
-async function checkForUpdates(showCurrent = false) {
-  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf-8'))
-  const currentVersion = packageJson.version
-
-  if (showCurrent) {
-    log(`Current version: ${currentVersion}`, 'dim')
-  }
-
-  try {
-    const response = await fetch('https://registry.npmjs.org/suparank/latest')
-    if (response.ok) {
-      const data = await response.json()
-      return { current: currentVersion, latest: data.version }
-    }
-  } catch (e) {
-    // Ignore fetch errors
-  }
-  return { current: currentVersion, latest: null }
-}
-
-async function runUpdate() {
-  logHeader('Suparank Update')
-
-  log('Checking for updates...', 'yellow')
-  const { current, latest } = await checkForUpdates(true)
-
-  if (!latest) {
-    log('Could not check for updates. Please try again later.', 'red')
-    return
-  }
-
-  log(`Latest version: ${latest}`, 'dim')
-  console.log()
-
-  if (current === latest) {
-    log('You are already on the latest version!', 'green')
-    return
-  }
-
-  // Show what will be preserved
-  log('Your data is safe:', 'cyan')
-  log('  ~/.suparank/config.json       (API key, project)', 'dim')
-  log('  ~/.suparank/credentials.json  (WordPress, Ghost, etc.)', 'dim')
-  log('  ~/.suparank/session.json      (Current session)', 'dim')
-  log('  ~/.suparank/content/          (Saved articles)', 'dim')
-  console.log()
-
-  log(`Updating from v${current} to v${latest}...`, 'yellow')
-  console.log()
-
-  // Clear npx cache and reinstall
-  const { execSync } = await import('child_process')
-
-  try {
-    // Clear the npx cache for suparank
-    log('Clearing cache...', 'dim')
-    execSync('npx clear-npx-cache 2>/dev/null || true', { stdio: 'pipe' })
-
-    // Force npx to fetch the latest version
-    log('Downloading latest version...', 'dim')
-    execSync('npm cache clean --force 2>/dev/null || true', { stdio: 'pipe' })
-
-    console.log()
-    log(`Updated to v${latest}!`, 'green')
-    console.log()
-    log('Run "npx suparank@latest" to use the new version.', 'cyan')
-    log('Or restart your AI client to pick up changes.', 'dim')
-  } catch (e) {
-    log(`Update failed: ${e.message}`, 'red')
-    console.log()
-    log('Try manually:', 'dim')
-    log('  npm cache clean --force', 'cyan')
-    log('  npx suparank@latest', 'cyan')
-  }
-}
-
-async function runMCP() {
+function runMCP() {
   const config = loadConfig()
 
   if (!config) {
     log('No configuration found. Running setup...', 'yellow')
     console.log()
-    await runSetup()
+    runSetup()
     return
   }
 
-  // Fetch project data for dashboard
-  let project = null
-  try {
-    const result = await testConnection(config.api_key, config.project_slug, config.api_url)
-    if (result.success) {
-      project = result.project
-    }
-  } catch (e) {
-    // Continue without project data
-  }
-
-  // Display dashboard
-  await displayDashboard(config, project)
-
-  // Find the MCP client script
+  // Find the MCP client script (modular version)
   const mcpClientPaths = [
+    path.join(import.meta.dirname, '..', 'mcp-client', 'index.js'),
+    path.join(process.cwd(), 'mcp-client', 'index.js'),
+    // Legacy fallback
     path.join(import.meta.dirname, '..', 'mcp-client.js'),
     path.join(process.cwd(), 'mcp-client.js')
   ]
@@ -790,7 +359,7 @@ async function runMCP() {
   }
 
   if (!mcpClientPath) {
-    log('Error: mcp-client.js not found', 'red')
+    log('Error: mcp-client not found', 'red')
     process.exit(1)
   }
 
@@ -820,10 +389,6 @@ switch (command) {
   case 'setup':
     runSetup()
     break
-  case 'credentials':
-  case 'creds':
-    runCredentialsSetup()
-    break
   case 'test':
     runTest()
     break
@@ -833,35 +398,19 @@ switch (command) {
   case 'clear':
     clearSession()
     break
-  case 'update':
-  case 'upgrade':
-    runUpdate()
-    break
-  case 'version':
-  case '-v':
-  case '--version':
-    showVersion()
-    break
   case 'help':
   case '--help':
   case '-h':
     logHeader('Suparank CLI')
-    log('AI-powered SEO content creation MCP', 'dim')
-    console.log()
-    log('Usage: npx suparank [command]', 'cyan')
+    log('Usage: npx suparank [command]', 'dim')
     console.log()
     log('Commands:', 'bright')
-    log('  (none)       Run MCP server (default)', 'dim')
-    log('  setup        Run setup wizard', 'dim')
-    log('  credentials  Configure local integrations', 'dim')
-    log('  test         Test API connection', 'dim')
-    log('  session      View current session state', 'dim')
-    log('  clear        Clear session state', 'dim')
-    log('  update       Check for updates and install latest', 'dim')
-    log('  version      Show version', 'dim')
-    log('  help         Show this help message', 'dim')
-    console.log()
-    log('Documentation: https://suparank.io/docs', 'cyan')
+    log('  (none)     Run MCP server (default)', 'dim')
+    log('  setup      Run setup wizard', 'dim')
+    log('  test       Test API connection', 'dim')
+    log('  session    View current session state', 'dim')
+    log('  clear      Clear session state', 'dim')
+    log('  help       Show this help message', 'dim')
     break
   default:
     runMCP()
