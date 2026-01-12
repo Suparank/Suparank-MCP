@@ -483,6 +483,12 @@ async function runSetup() {
 
   if (success) {
     showSetupComplete()
+
+    // Auto-run MCP after setup
+    console.log()
+    log('Starting MCP server...', 'cyan')
+    console.log()
+    await runMCP()
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "suparank",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "AI-powered SEO content creation MCP - generate and publish optimized blog posts with your AI assistant",
   "type": "module",
   "bin": {
