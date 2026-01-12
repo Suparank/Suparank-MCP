@@ -237,8 +237,7 @@ async function runDeviceAuthSetup() {
   let deviceResponse
   try {
     const response = await fetch(`${SUPARANK_API_URL}/auth/device`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
+      method: 'POST'
     })
 
     if (!response.ok) {
