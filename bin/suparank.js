@@ -15,9 +15,74 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as readline from 'readline'
-import { spawn } from 'child_process'
+import { spawn, execSync } from 'child_process'
+import { fileURLToPath } from 'url'
 
 const SUPARANK_DIR = path.join(os.homedir(), '.suparank')
+const VERSION_CACHE_FILE = path.join(SUPARANK_DIR, '.version-check')
+
+// Get current package version
+function getCurrentVersion() {
+  try {
+    const packagePath = path.join(import.meta.dirname, '..', 'package.json')
+    const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf-8'))
+    return pkg.version
+  } catch {
+    return null
+  }
+}
+
+// Check for updates (non-blocking, cached for 1 hour)
+async function checkForUpdates() {
+  const currentVersion = getCurrentVersion()
+  if (!currentVersion) return
+
+  // Check cache to avoid spamming npm registry
+  try {
+    if (fs.existsSync(VERSION_CACHE_FILE)) {
+      const cache = JSON.parse(fs.readFileSync(VERSION_CACHE_FILE, 'utf-8'))
+      const cacheAge = Date.now() - cache.timestamp
+      if (cacheAge < 3600000) { // 1 hour cache
+        if (cache.latest !== currentVersion && cache.latest > currentVersion) {
+          console.error(`[suparank] Update available: ${currentVersion} → ${cache.latest}`)
+        }
+        return
+      }
+    }
+  } catch {}
+
+  // Fetch latest version from npm (with timeout)
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 3000) // 3 second timeout
+
+    const response = await fetch('https://registry.npmjs.org/suparank/latest', {
+      signal: controller.signal
+    })
+    clearTimeout(timeout)
+
+    if (response.ok) {
+      const data = await response.json()
+      const latestVersion = data.version
+
+      // Cache the result
+      fs.mkdirSync(SUPARANK_DIR, { recursive: true })
+      fs.writeFileSync(VERSION_CACHE_FILE, JSON.stringify({
+        latest: latestVersion,
+        current: currentVersion,
+        timestamp: Date.now()
+      }))
+
+      if (latestVersion !== currentVersion && latestVersion > currentVersion) {
+        console.error(`[suparank] Update available: ${currentVersion} → ${latestVersion}`)
+        console.error('[suparank] Run: npx suparank@latest OR npx clear-npx-cache')
+      }
+    }
+  } catch {
+    // Silently fail - don't block MCP startup
+  }
+}
+
 const CONFIG_FILE = path.join(SUPARANK_DIR, 'config.json')
 const CREDENTIALS_FILE = path.join(SUPARANK_DIR, 'credentials.json')
 const SESSION_FILE = path.join(SUPARANK_DIR, 'session.json')
@@ -35,7 +100,7 @@ const colors = {
 }
 
 // Check if running in MCP mode (no command argument = MCP server)
-const isMCPMode = !process.argv[2] || !['setup', 'test', 'session', 'clear', 'help', '--help', '-h'].includes(process.argv[2])
+const isMCPMode = !process.argv[2] || !['setup', 'test', 'session', 'clear', 'update', 'version', '-v', '--version', 'help', '--help', '-h'].includes(process.argv[2])
 
 function log(message, color = 'reset') {
   // In MCP mode, use stderr to avoid breaking JSON protocol
@@ -344,7 +409,10 @@ function clearSession() {
   }
 }
 
-function runMCP() {
+async function runMCP() {
+  // Check for updates in background (non-blocking)
+  checkForUpdates()
+
   const config = loadConfig()
 
   if (!config) {
@@ -412,6 +480,27 @@ switch (command) {
   case 'clear':
     clearSession()
     break
+  case 'update':
+    logHeader('Updating Suparank')
+    log('Clearing npx cache and fetching latest version...', 'yellow')
+    try {
+      execSync('rm -rf ~/.npm/_npx', { stdio: 'inherit' })
+      log('Cache cleared!', 'green')
+      log('Next run will use the latest version.', 'dim')
+      // Also clear version cache
+      if (fs.existsSync(VERSION_CACHE_FILE)) {
+        fs.unlinkSync(VERSION_CACHE_FILE)
+      }
+    } catch (e) {
+      log(`Update failed: ${e.message}`, 'red')
+    }
+    break
+  case 'version':
+  case '-v':
+  case '--version':
+    const ver = getCurrentVersion()
+    console.log(ver || 'unknown')
+    break
   case 'help':
   case '--help':
   case '-h':
@@ -424,6 +513,8 @@ switch (command) {
     log('  test       Test API connection', 'dim')
     log('  session    View current session state', 'dim')
     log('  clear      Clear session state', 'dim')
+    log('  update     Clear cache and update to latest', 'dim')
+    log('  version    Show current version', 'dim')
     log('  help       Show this help message', 'dim')
     break
   default:
