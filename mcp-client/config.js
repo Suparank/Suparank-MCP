@@ -20,12 +20,17 @@ export const API_ENDPOINTS = {
 // Session expiration (24 hours)
 export const SESSION_EXPIRY_MS = 24 * 60 * 60 * 1000
 
-// Tools that are visible in the MCP tool list
+// Tools that are visible in the MCP tool list (ALL 23 tools)
 export const VISIBLE_TOOLS = [
-  // Essential (5) - Main workflow
-  'create_content', 'keyword_research', 'generate_image', 'publish_content', 'get_session',
-  // Session Management (5) - Content lifecycle
-  'save_content', 'list_content', 'load_content', 'remove_article', 'clear_session'
+  // Prompt Tools (11) - Backend API calls
+  'keyword_research', 'seo_strategy', 'topical_map', 'content_calendar',
+  'content_write', 'image_prompt', 'internal_links', 'schema_generate',
+  'geo_optimize', 'quality_check', 'full_pipeline',
+  // Action Tools (4) - Local execution
+  'generate_image', 'publish_wordpress', 'publish_ghost', 'send_webhook',
+  // Orchestrator Tools (8) - Session management
+  'create_content', 'save_content', 'publish_content', 'get_session',
+  'remove_article', 'clear_session', 'list_content', 'load_content'
 ]
 
 // Default stats object
