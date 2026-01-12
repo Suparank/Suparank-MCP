@@ -15,7 +15,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as readline from 'readline'
-import { spawn, execSync } from 'child_process'
+import { spawn, execSync, exec } from 'child_process'
 import { fileURLToPath } from 'url'
 
 const SUPARANK_DIR = path.join(os.homedir(), '.suparank')
@@ -210,7 +210,6 @@ function sleep(ms) {
 
 // Helper to open URL in browser
 function openBrowser(url) {
-  const { exec } = require('child_process')
   const platform = process.platform
 
   let command
