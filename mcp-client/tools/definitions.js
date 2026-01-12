@@ -659,21 +659,36 @@ OUTCOME: Article loaded into session, ready for optimization or re-publishing.`,
 ]
 
 /**
- * Essential tools shown in the tool list
+ * ALL tools visible in the MCP tool list (23 total)
  * MCP protocol requires tools to be listed for clients to call them
  */
 export const VISIBLE_TOOLS = [
-  // Essential (5) - Main workflow
-  'create_content',     // Main entry point - creates & publishes automatically
-  'keyword_research',   // Research keywords separately (on-demand)
-  'generate_image',     // Generate/regenerate images (on-demand)
-  'publish_content',    // Manual publish trigger (on-demand)
-  'get_session',        // Check status (on-demand)
+  // Prompt Tools (11) - Backend API calls
+  'keyword_research',   // Research keywords for SEO
+  'seo_strategy',       // Create SEO strategy and content brief
+  'topical_map',        // Design pillar-cluster content architecture
+  'content_calendar',   // Create editorial calendar
+  'content_write',      // Write SEO-optimized articles
+  'image_prompt',       // Create prompts for AI image generation
+  'internal_links',     // Develop internal linking plan
+  'schema_generate',    // Generate Schema.org JSON-LD markup
+  'geo_optimize',       // Optimize for AI search engines (GEO)
+  'quality_check',      // Pre-publish quality assurance
+  'full_pipeline',      // Complete 5-phase content pipeline
 
-  // Session Management (5) - Content lifecycle
+  // Action Tools (4) - Local execution with credentials
+  'generate_image',     // Generate AI images (fal.ai, Gemini, wiro)
+  'publish_wordpress',  // Publish to WordPress
+  'publish_ghost',      // Publish to Ghost CMS
+  'send_webhook',       // Send to Make.com, n8n, Zapier, Slack
+
+  // Orchestrator Tools (8) - Workflow management
+  'create_content',     // Main entry point - 4-phase workflow
   'save_content',       // Save article to session
-  'list_content',       // List saved content
-  'load_content',       // Load past content into session
+  'publish_content',    // Publish saved articles
+  'get_session',        // View session status
   'remove_article',     // Remove article from session
-  'clear_session'       // Clear all session content
+  'clear_session',      // Clear all session content
+  'list_content',       // List saved content from disk
+  'load_content'        // Load past content into session
 ]
