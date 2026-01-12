@@ -291,14 +291,20 @@ Use format: [IMAGE: description of what image should show]` : '**Note:** Images 
     store: 'outline'
   })
 
-  // Step: Write Content
-  stepNum++
-  steps.push({
-    step: stepNum,
-    type: 'llm_execute',
-    action: 'content_write',
-    instruction: `Write the COMPLETE article following your outline.
+  // Step: Write Content (generates N steps for N articles)
+  for (let articleIndex = 0; articleIndex < count; articleIndex++) {
+    const articleNum = articleIndex + 1
+    const isFirstArticle = articleIndex === 0
+    const isLastArticle = articleIndex === count - 1
 
+    stepNum++
+    steps.push({
+      step: stepNum,
+      type: 'llm_execute',
+      action: 'content_write',
+      instruction: `${count > 1 ? `## 📝 ARTICLE ${articleNum} OF ${count}\n\n` : ''}Write the COMPLETE article following your outline.
+${count > 1 && !isFirstArticle ? `\n**Progress:** ${articleIndex} article(s) already saved. Now creating article ${articleNum}.` : ''}
+${count > 1 ? `**Topic:** Use topic #${articleNum} from your content calendar.\n` : ''}
 **MANDATORY WORD COUNT: ${targetWordCount} WORDS MINIMUM**
 This is a strict requirement from the project settings.
 The article will be REJECTED if under ${targetWordCount} words.
@@ -323,16 +329,19 @@ ${shouldGenerateImages ? '- Image placeholders: [IMAGE: description] where image
 - FAQ section with 5-8 Q&As (detailed answers, not one-liners)
 - Strong conclusion with clear CTA
 
-**After writing ${targetWordCount}+ words, call 'save_content' with:**
+**MANDATORY: After writing ${targetWordCount}+ words, call 'save_content' with:**
 - title: Your SEO-optimized title
 - content: The full article (markdown)
 - keywords: Array of target keywords
 - meta_description: Your 150-160 char meta description
 
 STOP! Before calling save_content, verify you have ${targetWordCount}+ words.
-Count the words. If under ${targetWordCount}, ADD MORE CONTENT.`,
-    store: 'article'
-  })
+Count the words. If under ${targetWordCount}, ADD MORE CONTENT.
+${count > 1 && !isLastArticle ? `\n⚠️ After saving this article, you MUST continue with article ${articleNum + 1} of ${count}. Do NOT publish until all ${count} articles are saved.` : ''}
+${count > 1 && isLastArticle ? `\n✅ This is the LAST article (${articleNum} of ${count}). After saving, all articles will be ready for publishing.` : ''}`,
+      store: `article${count > 1 ? `_${articleNum}` : ''}`
+    })
+  }
 
   // ═══════════════════════════════════════════════════════════
   // OPTIMIZATION PHASE
@@ -490,6 +499,7 @@ Call 'publish_content' tool - it will automatically use:
       niche: niche
     },
     settings: {
+      article_count: count,  // Track expected article count for progress
       target_word_count: targetWordCount,
       reading_level: readingLevel,
       reading_level_display: readingLevelDisplay,

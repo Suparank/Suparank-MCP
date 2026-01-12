@@ -205,7 +205,16 @@ async function handleSaveContent(args) {
   const wordCountOk = targetWordCount ? wordCount >= targetWordCount * 0.95 : true
   const shortfall = targetWordCount ? targetWordCount - wordCount : 0
 
+  // Multi-article progress tracking
+  const totalExpected = workflow?.settings?.article_count || 1
+  const savedCount = sessionState.articles.length
+  const remaining = totalExpected - savedCount
+  const isMultiArticle = totalExpected > 1
+
   log(`Word count check: ${wordCount} words (target: ${targetWordCount}, ok: ${wordCountOk})`)
+  if (isMultiArticle) {
+    log(`Multi-article progress: ${savedCount}/${totalExpected} saved, ${remaining} remaining`)
+  }
 
   // Find next step info
   const imageStep = workflow?.steps?.find(s => s.action === 'generate_images')
@@ -261,13 +270,28 @@ Please EXPAND the content before publishing.
 ` : ''}
 ${!meta_description ? '**Warning:** Meta description is missing. Add it for better SEO.\n' : ''}
 ${articlesListSection}${categoriesSection}
-## Next Step${includeImages && imageStep ? ': Generate Images' : ': Ready to Publish or Continue'}
+${isMultiArticle && remaining > 0 ? `## ⚠️ MULTI-ARTICLE WORKFLOW: ${remaining} Article(s) Remaining
+
+**Progress:** ${savedCount} of ${totalExpected} articles saved.
+
+**NEXT ACTION REQUIRED:**
+1. Create article ${savedCount + 1} of ${totalExpected} using topic from content calendar
+2. Call \`content_write\` or write the article directly
+3. Call \`save_content\` to save it
+
+⛔ Do NOT publish until all ${totalExpected} articles are saved!
+` : ''}${isMultiArticle && remaining <= 0 ? `## ✅ ALL ${totalExpected} ARTICLES SAVED!
+
+All articles in your batch are complete. Ready to publish.
+
+**Next:** Call \`publish_content\` to publish all ${savedCount} articles.
+` : ''}${!isMultiArticle ? `## Next Step${includeImages && imageStep ? ': Generate Images' : ': Ready to Publish or Continue'}
 ${includeImages && imageStep ? `Generate **${totalImages} images** (1 cover + ${totalImages - 1} inline images).
 
 Call \`generate_image\` ${totalImages} times with prompts based on your article sections.` : `You can:
 - **Add more articles**: Continue creating content (each save_content adds to the batch)
 - **Publish all**: Call \`publish_content\` to publish all ${sessionState.articles.length} article(s)
-- **View session**: Call \`get_session\` to see all saved articles`}`
+- **View session**: Call \`get_session\` to see all saved articles`}` : ''}`
     }]
   }
 }
@@ -465,6 +489,11 @@ function handleGetSession() {
     return sum + (a.imageUrl ? 1 : 0) + (a.inlineImages?.length || 0)
   }, 0)
 
+  // Multi-article workflow progress
+  const expectedArticles = workflow?.settings?.article_count || 1
+  const isMultiArticle = expectedArticles > 1
+  const remainingArticles = expectedArticles - totalArticles
+
   const articlesSection = sessionState.articles.length > 0 ? `
 ## Saved Articles (${totalArticles} total)
 
@@ -494,16 +523,27 @@ No articles saved yet. Use \`save_content\` after writing an article.
 *This article is being edited. Call \`save_content\` to add it to the session.*
 ` : ''
 
+  // Multi-article progress section
+  const multiArticleProgress = isMultiArticle ? `
+## 📊 Multi-Article Workflow Progress
+**Status:** ${totalArticles}/${expectedArticles} articles saved${remainingArticles > 0 ? ` (${remainingArticles} remaining)` : ' ✅ Complete!'}
+${remainingArticles > 0 ? `
+⚠️ **NEXT:** Create article ${totalArticles + 1} of ${expectedArticles} and save it.
+⛔ Do NOT publish until all ${expectedArticles} articles are saved.
+` : `
+✅ All articles saved! Ready to call \`publish_content\`.
+`}` : ''
+
   return {
     content: [{
       type: 'text',
       text: `# Session State
 
 **Workflow:** ${workflow?.workflow_id || 'None active'}
-**Total Articles:** ${totalArticles}
+**Total Articles:** ${totalArticles}${isMultiArticle ? ` / ${expectedArticles} expected` : ''}
 **Ready to Publish:** ${unpublishedArticles.length}
 **Already Published:** ${publishedArticles.length}
-${articlesSection}${currentWorkingSection}
+${multiArticleProgress}${articlesSection}${currentWorkingSection}
 ## Current Working Images (${imagesGenerated}/${totalImagesNeeded})
 **Cover Image:** ${sessionState.imageUrl || 'Not generated'}
 **Inline Images:** ${sessionState.inlineImages.length > 0 ? sessionState.inlineImages.map((url, i) => `\n  ${i+1}. ${url.substring(0, 60)}...`).join('') : 'None'}

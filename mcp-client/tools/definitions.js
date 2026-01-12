@@ -428,13 +428,22 @@ TRIGGERS - Use when user says:
 - "make content about..."
 - any request involving writing/creating/generating articles or blog posts
 
-WORKFLOW (automatic 4-phase):
-1. RESEARCH: Keywords, SEO strategy, content structure
-2. CREATION: Outline, write full article, save to session
-3. OPTIMIZATION: Quality check, GEO optimization for AI search
-4. PUBLISHING: Generate images, publish to WordPress/Ghost
+SINGLE ARTICLE (count=1): Creates, saves, and publishes 1 article automatically.
 
-OUTCOME: Complete article written, optimized, and published to CMS.`,
+MULTIPLE ARTICLES (count>1): Creates a workflow with N separate article steps.
+- Each article MUST be written and saved with save_content
+- Progress tracked: "Article 1 of 5", "Article 2 of 5", etc.
+- get_session shows "3/5 articles saved"
+- Do NOT publish until ALL articles are saved
+- After all saved, call publish_content to publish batch
+
+WORKFLOW (automatic 4-phase):
+1. RESEARCH: Keywords, SEO strategy, content calendar
+2. CREATION: (write + save) × N articles
+3. OPTIMIZATION: Quality check, GEO optimization
+4. PUBLISHING: Generate images, publish all to CMS
+
+OUTCOME: Complete article(s) written, optimized, and published to CMS.`,
     inputSchema: {
       type: 'object',
       properties: {
