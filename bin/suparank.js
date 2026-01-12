@@ -178,10 +178,11 @@ function prompt(question) {
   })
 }
 
-async function testConnection(apiKey, projectSlug, apiUrl = null) {
+const SUPARANK_API_URL = 'https://api.suparank.io'
+
+async function testConnection(apiKey, projectSlug) {
   try {
-    const url = apiUrl || process.env.SUPARANK_API_URL || 'http://localhost:3000'
-    const response = await fetch(`${url}/projects/${projectSlug}`, {
+    const response = await fetch(`${SUPARANK_API_URL}/projects/${projectSlug}`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
@@ -202,16 +203,161 @@ async function testConnection(apiKey, projectSlug, apiUrl = null) {
   }
 }
 
-async function runSetup() {
-  logHeader('Suparank Setup Wizard')
+// Helper to sleep for a given number of milliseconds
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
-  log('Welcome to Suparank!', 'cyan')
-  log('This wizard will help you configure your MCP client.', 'dim')
+// Helper to open URL in browser
+function openBrowser(url) {
+  const { exec } = require('child_process')
+  const platform = process.platform
+
+  let command
+  if (platform === 'darwin') {
+    command = `open "${url}"`
+  } else if (platform === 'win32') {
+    command = `start "" "${url}"`
+  } else {
+    command = `xdg-open "${url}"`
+  }
+
+  return new Promise((resolve) => {
+    exec(command, (error) => {
+      resolve(!error)
+    })
+  })
+}
+
+// Device authorization flow
+async function runDeviceAuthSetup() {
+  log('Getting authorization code...', 'yellow')
+
+  // Request device code from API
+  let deviceResponse
+  try {
+    const response = await fetch(`${SUPARANK_API_URL}/auth/device`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`)
+    }
+
+    deviceResponse = await response.json()
+  } catch (e) {
+    log(`Failed to get authorization code: ${e.message}`, 'red')
+    log('Please check your internet connection and try again.', 'dim')
+    process.exit(1)
+  }
+
+  const { device_code, user_code, verification_uri_complete, expires_in, interval } = deviceResponse
+
+  // Display code to user
+  console.log()
+  log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'dim')
+  console.log()
+  log(`  Your code: ${colors.bright}${colors.cyan}${user_code}${colors.reset}`, 'reset')
+  console.log()
+  log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'dim')
+  console.log()
+  log('Open this URL to authorize:', 'dim')
+  log(`  ${verification_uri_complete}`, 'cyan')
   console.log()
 
+  // Try to open browser
+  const openChoice = await prompt('Press Enter to open browser (or "n" to skip): ')
+  if (openChoice.toLowerCase() !== 'n') {
+    const opened = await openBrowser(verification_uri_complete)
+    if (opened) {
+      log('Browser opened!', 'green')
+    } else {
+      log('Could not open browser. Please open the URL manually.', 'yellow')
+    }
+  }
+
+  // Poll for authorization
+  console.log()
+  log('Waiting for authorization...', 'yellow')
+  log(`(Code expires in ${Math.floor(expires_in / 60)} minutes)`, 'dim')
+  console.log()
+
+  const startTime = Date.now()
+  const expiresAt = startTime + (expires_in * 1000)
+  let dots = 0
+
+  while (Date.now() < expiresAt) {
+    await sleep(interval * 1000)
+
+    try {
+      const pollResponse = await fetch(`${SUPARANK_API_URL}/auth/device/${device_code}`)
+      const result = await pollResponse.json()
+
+      if (result.error === 'authorization_pending') {
+        // Show progress
+        dots = (dots + 1) % 4
+        process.stdout.write(`\r  Waiting${'.'.repeat(dots)}${' '.repeat(3 - dots)}`)
+        continue
+      }
+
+      if (result.error === 'slow_down') {
+        await sleep(interval * 1000) // Double wait
+        continue
+      }
+
+      if (result.error === 'expired_token') {
+        console.log()
+        log('Authorization code expired. Please run setup again.', 'red')
+        process.exit(1)
+      }
+
+      if (result.error === 'access_denied') {
+        console.log()
+        log('Authorization was denied.', 'red')
+        process.exit(1)
+      }
+
+      // Success!
+      console.log()
+      console.log()
+      log('Authorization successful!', 'green')
+      console.log()
+
+      // Save config
+      const config = {
+        api_key: result.api_key,
+        project_slug: result.project_slug,
+        created_at: new Date().toISOString()
+      }
+
+      saveConfig(config)
+
+      log(`Project: ${result.project_name}`, 'cyan')
+      if (result.user_email) {
+        log(`User: ${result.user_email}`, 'dim')
+      }
+      log('Configuration saved!', 'green')
+
+      return true
+
+    } catch (e) {
+      // Network error, continue polling
+      dots = (dots + 1) % 4
+      process.stdout.write(`\r  Waiting${'.'.repeat(dots)}${' '.repeat(3 - dots)}`)
+    }
+  }
+
+  console.log()
+  log('Authorization timed out. Please run setup again.', 'red')
+  process.exit(1)
+}
+
+// Manual setup flow (fallback)
+async function runManualSetup() {
   // Step 1: Get API key
   log('Step 1: API Key', 'bright')
-  log('Get your API key from: https://suparank.io/dashboard/settings/api-keys', 'dim')
+  log('Get your API key from: https://app.suparank.io/dashboard/settings/api-keys', 'dim')
   console.log()
 
   const apiKey = await prompt('Enter your API key: ')
@@ -232,25 +378,15 @@ async function runSetup() {
     process.exit(1)
   }
 
-  // Step 3: API URL (optional)
-  console.log()
-  log('Step 3: API URL (optional)', 'bright')
-  log('Press Enter for default, or enter custom URL for self-hosted/development', 'dim')
-  const defaultUrl = process.env.SUPARANK_API_URL || 'http://localhost:3000'
-  console.log()
-
-  const apiUrlInput = await prompt(`API URL [${defaultUrl}]: `)
-  const apiUrl = apiUrlInput || defaultUrl
-
   // Test connection
   console.log()
   log('Testing connection...', 'yellow')
 
-  const result = await testConnection(apiKey, projectSlug, apiUrl)
+  const result = await testConnection(apiKey, projectSlug)
 
   if (!result.success) {
     log(`Connection failed: ${result.error}`, 'red')
-    log('Please check your API key, project slug, and API URL.', 'dim')
+    log('Please check your API key and project slug.', 'dim')
     process.exit(1)
   }
 
@@ -260,16 +396,20 @@ async function runSetup() {
   const config = {
     api_key: apiKey,
     project_slug: projectSlug,
-    api_url: apiUrl,
     created_at: new Date().toISOString()
   }
 
   saveConfig(config)
   log('Configuration saved!', 'green')
 
-  // Step 3: Optional credentials
+  return true
+}
+
+// Show setup complete message
+function showSetupComplete() {
+  // Optional credentials
   console.log()
-  log('Step 3: Local Credentials (optional)', 'bright')
+  log('Optional: Local Credentials', 'bright')
   log('For image generation and CMS publishing, create:', 'dim')
   log(`  ${CREDENTIALS_FILE}`, 'cyan')
   console.log()
@@ -281,10 +421,6 @@ async function runSetup() {
   "wordpress": {
     "site_url": "https://your-site.com",
     "secret_key": "FROM_PLUGIN_SETTINGS"
-  },
-  "ghost": {
-    "api_url": "https://your-ghost.com",
-    "admin_api_key": "YOUR_GHOST_ADMIN_KEY"
   }
 }`)
 
@@ -323,6 +459,35 @@ async function runSetup() {
   log('  npx suparank clear   - Clear session', 'dim')
 }
 
+async function runSetup() {
+  logHeader('Suparank Setup Wizard')
+
+  log('Welcome to Suparank!', 'cyan')
+  log('This wizard will connect your CLI to your Suparank account.', 'dim')
+  console.log()
+
+  // Offer setup method choice
+  log('Setup method:', 'bright')
+  log('  1. Browser authorization (recommended)', 'dim')
+  log('  2. Manual API key entry', 'dim')
+  console.log()
+
+  const choice = await prompt('Choice [1]: ')
+
+  console.log()
+
+  let success = false
+  if (choice === '2') {
+    success = await runManualSetup()
+  } else {
+    success = await runDeviceAuthSetup()
+  }
+
+  if (success) {
+    showSetupComplete()
+  }
+}
+
 async function runTest() {
   logHeader('Testing Connection')
 
@@ -333,11 +498,11 @@ async function runTest() {
   }
 
   log(`Project: ${config.project_slug}`, 'dim')
-  log(`API URL: ${config.api_url}`, 'dim')
+  log(`API URL: ${SUPARANK_API_URL}`, 'dim')
   console.log()
 
   log('Testing...', 'yellow')
-  const result = await testConnection(config.api_key, config.project_slug, config.api_url)
+  const result = await testConnection(config.api_key, config.project_slug)
 
   if (result.success) {
     log(`Success! Connected to: ${result.project.name}`, 'green')
@@ -450,7 +615,7 @@ async function runMCP() {
     stdio: ['inherit', 'inherit', 'inherit'],
     env: {
       ...process.env,
-      SUPARANK_API_URL: config.api_url
+      SUPARANK_API_URL: SUPARANK_API_URL
     }
   })
 
