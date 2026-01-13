@@ -152,16 +152,16 @@ async function configureFal(creds) {
     // Model selection
     console.log()
     log('Select model:', 'bright')
-    log('  1. fal-ai/flux-pro/v1.1 (recommended)', 'dim')
-    log('  2. fal-ai/flux/dev', 'dim')
+    log('  1. google/nano-banana-pro (recommended)', 'dim')
+    log('  2. google/nano-banana', 'dim')
     log('  3. Custom', 'dim')
     console.log()
 
     const modelChoice = await prompt('Enter choice [1]: ')
-    let model = 'fal-ai/flux-pro/v1.1'
+    let model = 'google/nano-banana-pro'
 
     if (modelChoice === '2') {
-      model = 'fal-ai/flux/dev'
+      model = 'google/nano-banana'
     } else if (modelChoice === '3') {
       model = await prompt('Enter model name: ') || model
     }
@@ -684,7 +684,7 @@ async function viewCurrentConfig() {
 
 async function testFalConnection(apiKey) {
   try {
-    const response = await fetch('https://fal.run/fal-ai/flux/dev', {
+    const response = await fetch('https://fal.run/fal-ai/nano-banana-pro', {
       method: 'POST',
       headers: {
         'Authorization': `Key ${apiKey}`,
