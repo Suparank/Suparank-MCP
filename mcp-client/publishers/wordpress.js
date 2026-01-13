@@ -73,8 +73,31 @@ export async function fetchWordPressCategories() {
  */
 export async function executeWordPressPublish(args) {
   const credentials = getCredentials()
-  const wpConfig = credentials.wordpress
-  const { title, content, status = 'draft', categories = [], tags = [], featured_image_url } = args
+  const wpConfig = credentials?.wordpress
+  const { title: argTitle, content, status = 'draft', categories = [], tags = [], featured_image_url } = args
+
+  // Fall back to session title if not provided in args
+  const title = argTitle || sessionState.title
+
+  // Validate title before making request
+  if (!title || title.trim() === '') {
+    throw new Error(
+      'Title is required for WordPress publishing.\n\n' +
+      'Either:\n' +
+      '1. Include a title in the publish_wordpress call\n' +
+      '2. Use save_content first to set a title in the session\n\n' +
+      'Example: publish_wordpress({ title: "My Article", content: "..." })'
+    )
+  }
+
+  // Validate WordPress credentials
+  if (!wpConfig) {
+    throw new Error(
+      'WordPress not configured.\n\n' +
+      'Run: npx suparank secrets\n' +
+      'Or add WordPress credentials to ~/.suparank/credentials.json'
+    )
+  }
 
   progress('Publish', `Publishing to WordPress: "${title}"`)
   log(`Publishing to WordPress: ${title}`)
@@ -131,6 +154,8 @@ async function publishWithPlugin(wpConfig, { title, htmlContent, status, categor
   })
 
   let lastError = null
+  let lastStatusCode = null
+
   for (const endpoint of endpoints) {
     try {
       const response = await fetchWithRetry(endpoint.url, {
@@ -149,13 +174,47 @@ async function publishWithPlugin(wpConfig, { title, htmlContent, status, categor
           return formatSuccessResponse(result.post, status)
         }
       }
-      lastError = await response.text()
+
+      lastStatusCode = response.status
+      const responseText = await response.text()
+
+      // Try to parse WordPress error response
+      try {
+        const errorJson = JSON.parse(responseText)
+        if (errorJson.message) {
+          lastError = errorJson.message
+        } else if (errorJson.error) {
+          lastError = errorJson.error
+        } else {
+          lastError = responseText
+        }
+      } catch {
+        lastError = responseText
+      }
+
+      // If we got a definitive error (not auth), don't try fallback
+      if (lastStatusCode === 400) {
+        break
+      }
     } catch (e) {
       lastError = e.message
     }
   }
 
-  throw new Error(`WordPress error: ${lastError}`)
+  // Build helpful error message based on status code
+  let errorMessage = `WordPress publishing failed: ${lastError}`
+
+  if (lastStatusCode === 401 || lastStatusCode === 403) {
+    errorMessage += '\n\nThis usually means the API key is invalid or expired.\n' +
+      'Check your secret_key in ~/.suparank/credentials.json matches the one in WordPress > Settings > Suparank.'
+  } else if (lastStatusCode === 404) {
+    errorMessage += '\n\nThe Suparank plugin endpoint was not found.\n' +
+      'Make sure the Suparank Connector plugin is installed and activated in WordPress.'
+  } else if (lastStatusCode === 500) {
+    errorMessage += '\n\nWordPress server error. Check WordPress error logs for details.'
+  }
+
+  throw new Error(errorMessage)
 }
 
 /**

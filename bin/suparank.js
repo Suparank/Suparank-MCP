@@ -6,6 +6,7 @@
  * Usage:
  *   npx suparank              - Run MCP (or setup if first time)
  *   npx suparank setup        - Run setup wizard
+ *   npx suparank secrets      - Configure API keys (fal, WordPress, etc.)
  *   npx suparank test         - Test API connection
  *   npx suparank session      - View current session state
  *   npx suparank clear        - Clear session state
@@ -17,6 +18,7 @@ import * as os from 'os'
 import * as readline from 'readline'
 import { spawn, execSync, exec } from 'child_process'
 import { fileURLToPath } from 'url'
+import { runSecrets } from './secrets-wizard.js'
 
 const SUPARANK_DIR = path.join(os.homedir(), '.suparank')
 const VERSION_CACHE_FILE = path.join(SUPARANK_DIR, '.version-check')
@@ -100,7 +102,7 @@ const colors = {
 }
 
 // Check if running in MCP mode (no command argument = MCP server)
-const isMCPMode = !process.argv[2] || !['setup', 'test', 'session', 'clear', 'update', 'version', '-v', '--version', 'help', '--help', '-h'].includes(process.argv[2])
+const isMCPMode = !process.argv[2] || !['setup', 'test', 'session', 'clear', 'update', 'secrets', 'version', '-v', '--version', 'help', '--help', '-h'].includes(process.argv[2])
 
 function log(message, color = 'reset') {
   // In MCP mode, use stderr to avoid breaking JSON protocol
@@ -640,6 +642,9 @@ switch (command) {
   case 'setup':
     runSetup()
     break
+  case 'secrets':
+    runSecrets()
+    break
   case 'test':
     runTest()
     break
@@ -679,6 +684,7 @@ switch (command) {
     log('Commands:', 'bright')
     log('  (none)     Run MCP server (default)', 'dim')
     log('  setup      Run setup wizard', 'dim')
+    log('  secrets    Configure API keys (fal, WordPress, etc.)', 'dim')
     log('  test       Test API connection', 'dim')
     log('  session    View current session state', 'dim')
     log('  clear      Clear session state', 'dim')
