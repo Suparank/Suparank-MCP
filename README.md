@@ -174,3 +174,4 @@ Full documentation at [suparank.io/docs](https://suparank.io/docs)
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
